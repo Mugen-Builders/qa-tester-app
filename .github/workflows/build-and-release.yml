@@ -1,0 +1,156 @@
+name: build-and-release
+run-name: Testing and Releasing the QA tester application
+on: [push, workflow_dispatch]
+
+# Pins (override with repository variables of the same name):
+#   EMULATOR_VERSION 0.21.0, MACHINE_LINUX_VERSION 0.21.0, KERNEL_VERSION 6.5.13-ctsi-2,
+#   XGENEXT2_VERSION 1.5.6-1, CARTESI_CLI_VERSION 2.0.0-alpha.38, FOUNDRY_VERSION v1.4.3
+# Foundry's `cast` encodes every test input (docs/inputs.md); the CLI builds, boots and stores the
+# template with the state NVRAM declared in cartesi.toml (docs/build.md).
+jobs:
+  host-tests:
+    # libqatester against the libcmt mock and libcma built from source: no machine needed.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-14 make git curl
+
+      - name: Install Foundry (cast encodes the mock e2e inputs)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ vars.FOUNDRY_VERSION || 'v1.4.3' }}
+
+      - name: Build dependencies (machine-guest-tools, machine-asset-tools)
+        run: make deps CXX=g++-14 CC=gcc-14
+
+      - name: Unit tests and mock-rollup e2e
+        run: make host-test CXX=g++-14
+
+  build-and-test:
+    runs-on: ubuntu-24.04
+    environment: Main
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Cartesi Machine
+        run: |
+          curl -s -L https://cartesi.github.io/linux-packages/apt/keys/cartesi-deb-key.gpg.bin | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/cartesi-deb-key.gpg
+          curl -s -L https://cartesi.github.io/linux-packages/apt/stable/sources.list | sudo tee /etc/apt/sources.list.d/cartesi-deb-apt.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends squashfs-tools \
+            xgenext2fs=${{ vars.XGENEXT2_VERSION || '1.5.6-1' }}
+
+          curl -fsSL -o ${{ runner.temp }}/cartesi-machine.deb https://github.com/cartesi/machine-emulator/releases/download/v${{ vars.EMULATOR_VERSION || '0.21.0' }}/machine-emulator_amd64.deb
+          sudo apt-get install -y --no-install-recommends ${{ runner.temp }}/cartesi-machine.deb
+
+          curl -fsSL -o ${{ runner.temp }}/linux.bin https://github.com/cartesi/machine-linux-image/releases/download/v${{ vars.MACHINE_LINUX_VERSION || '0.21.0' }}/linux-${{ vars.KERNEL_VERSION || '6.5.13-ctsi-2' }}-v${{ vars.MACHINE_LINUX_VERSION || '0.21.0' }}.bin
+          curl -fsSL -o ${{ runner.temp }}/linux.bin.sha512 https://github.com/cartesi/machine-linux-image/releases/download/v${{ vars.MACHINE_LINUX_VERSION || '0.21.0' }}/linux-${{ vars.KERNEL_VERSION || '6.5.13-ctsi-2' }}-v${{ vars.MACHINE_LINUX_VERSION || '0.21.0' }}.bin.sha512
+
+      - name: Check RAM image
+        working-directory: ${{ runner.temp }}
+        run: |
+          echo "$(cut -d' ' -f1 linux.bin.sha512)  linux.bin" | sha512sum -c -
+          sudo mkdir -p /usr/share/cartesi-machine/images
+          sudo cp linux.bin /usr/share/cartesi-machine/images/linux.bin
+          ls -l /usr/share/cartesi-machine/images/linux.bin
+
+      - name: Check Cartesi Machine
+        run: |
+          cartesi-machine --version
+          xgenext2fs --version
+          mksquashfs -version | head -1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+
+      - name: Install Cartesi CLI
+        run: |
+          npm install -g @cartesi/cli@${{ vars.CARTESI_CLI_VERSION || '2.0.0-alpha.38' }}
+          cartesi --version
+
+      - name: Install Foundry (cast encodes the machine test inputs)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ vars.FOUNDRY_VERSION || 'v1.4.3' }}
+
+      - name: Build drives, boot and store the template (with the state NVRAM)
+        run: cartesi build --verbose
+
+      - name: Template hash and flash drives
+        run: |
+          cartesi hash
+          sha256sum .cartesi/root.ext2 .cartesi/app.sqfs
+
+      - name: Check the accounts-drive start index (docs/build.md)
+        run: |
+          start=$(jq -r '(.config // .).nvram[] | select(.label == "state") | .start' .cartesi/image/config.json)
+          index=$(grep -oP 'accounts_drive_start_index\s*=\s*\K\d+' cartesi.toml)
+          printf 'state NVRAM start %#x -> accounts_drive_start_index %d (cartesi.toml: %d)\n' "$start" $((start >> 22)) "$index"
+          test $((start >> 22)) -eq "$index"
+
+      - name: Machine tests
+        run: |
+          pip3 install --user pytest
+          python3 -m pytest tests/machine -v
+
+      - name: Create artifact archive
+        run: |
+          cd .cartesi/image && tar -czf ../../qa-tester-snapshot.tar.gz * && cd ../..
+          sha256sum qa-tester-snapshot.tar.gz > qa-tester-snapshot.tar.gz.sha256
+          cp .cartesi/app.sqfs qa-tester-app.sqfs
+          sha256sum qa-tester-app.sqfs > qa-tester-app.sqfs.sha256
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: qa-tester-snapshot
+          path: |
+            qa-tester-snapshot.tar.gz
+            qa-tester-snapshot.tar.gz.sha256
+            qa-tester-app.sqfs
+            qa-tester-app.sqfs.sha256
+          retention-days: 2
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [host-tests, build-and-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          find artifacts -name "*.sqfs" -exec cp {} release-assets/ \;
+          find artifacts -name "*.sha256" -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          prerelease: true
+          files: release-assets/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
