@@ -174,7 +174,7 @@ jobs:
       - name: Cycle-0 image reproduces the template
         run: |
           make seq-cycle0
-          cartesi-machine --load=build/seq/cycle0 --assert-rolling-template --final-hash --store=build/seq/verify | tee build/seq/verify.log
+          cartesi-machine --load=build/seq/cycle0 --assert-rolling-template --final-hash --store=build/seq/verify 2>&1 | tee build/seq/verify.log
           booted=$(grep -oE '[0-9a-f]{64}' build/seq/verify.log | tail -1)
           stored=$(cartesi-machine-stored-hash .cartesi/image | sed 's/^0x//')
           echo "booted cycle-0: $booted"; echo "cartesi build:  $stored"
