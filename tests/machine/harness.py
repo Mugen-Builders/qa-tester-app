@@ -17,6 +17,13 @@ ROOT = HERE.parent.parent
 
 APP = "0x" + "ab" * 20
 USER = "0x1111111111111111111111111111111111111111"
+# sequencer variant: batch submitter = anvil account 9 (the devnet default written by `make seq/config-devnet.bin`)
+SEQUENCER = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
+SEQUENCER_KEY = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+# a signing user: anvil account 1
+SIGNER = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+SIGNER_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+MAX_WAIT_BLOCKS = 1200
 TOKEN = "0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81"
 ERC20_PORTAL = "0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419"
 ETHER_PORTAL = "0x035b11Be55656c6cfC822D1CaE568C1Af2e497b0"
@@ -95,6 +102,88 @@ def packed_deposit(kind: str, *args) -> bytes:
     raise ValueError(f"unknown deposit kind {kind}")
 
 
+# ---------------------------------------------------------------- sequencer batches (SSZ)
+# sequencer-core/src/batch.rs: Batch{nonce u64, frames List<Frame>}, Frame{user_ops List<WireUserOp>,
+# safe_block u64, fee_price u16}, WireUserOp{nonce u32, max_fee u16, data List<u8>, signature List<u8>}.
+# SSZ containers: fixed fields in place, variable ones as 4-byte offsets followed by their bytes.
+# seq/guest/tests/fold.rs pins the same vector (ssz_vector_for_the_python_harness).
+def _ssz_container(fixed_parts, variable_parts):
+    """fixed_parts: list of bytes or None (None = a variable field at that position, in order)."""
+    fixed_len = sum(len(p) if p is not None else 4 for p in fixed_parts)
+    out = b""
+    offset = fixed_len
+    vi = 0
+    for p in fixed_parts:
+        if p is None:
+            out += offset.to_bytes(4, "little")
+            offset += len(variable_parts[vi])
+            vi += 1
+        else:
+            out += p
+    return out + b"".join(variable_parts)
+
+
+def _ssz_list_of_variable(items: list) -> bytes:
+    offsets = b""
+    off = 4 * len(items)
+    for it in items:
+        offsets += off.to_bytes(4, "little")
+        off += len(it)
+    return offsets + b"".join(items)
+
+
+def user_op(nonce: int, max_fee: int, data: bytes, signature: bytes) -> bytes:
+    return _ssz_container([nonce.to_bytes(4, "little"), max_fee.to_bytes(2, "little"), None, None], [data, signature])
+
+
+def frame(safe_block: int, fee_price: int = 0, user_ops=()) -> bytes:
+    return _ssz_container([None, safe_block.to_bytes(8, "little"), fee_price.to_bytes(2, "little")],
+                          [_ssz_list_of_variable(list(user_ops))])
+
+
+def batch(nonce: int, frames) -> bytes:
+    """SSZ Batch; `frames` are `frame(...)` byte strings."""
+    return _ssz_container([nonce.to_bytes(8, "little"), None], [_ssz_list_of_variable(list(frames))])
+
+
+def sign_user_op(private_key: str, nonce: int, max_fee: int, data: bytes, chain: int = 31337, app: str = APP) -> bytes:
+    """EIP-712 signature of UserOp{uint32 nonce; uint16 max_fee; bytes data} under the sequencer's
+    domain (CartesiAppSequencer/1, verifyingContract = app), produced by `cast wallet sign --data`.
+    The 65 bytes (r, s, v) are what the sequencer's POST /tx and the batch envelope carry."""
+    typed = {
+        "types": {
+            "EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"},
+                             {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
+            "UserOp": [{"name": "nonce", "type": "uint32"}, {"name": "max_fee", "type": "uint16"},
+                       {"name": "data", "type": "bytes"}],
+        },
+        "primaryType": "UserOp",
+        "domain": {"name": "CartesiAppSequencer", "version": "1", "chainId": chain, "verifyingContract": app},
+        "message": {"nonce": nonce, "max_fee": max_fee, "data": "0x" + data.hex()},
+    }
+    p = subprocess.run(["cast", "wallet", "sign", "--private-key", private_key, "--data", json.dumps(typed)],
+                       capture_output=True, text=True, check=True)
+    sig = bytes.fromhex(p.stdout.strip()[2:])
+    assert len(sig) == 65, sig.hex()
+    return sig
+
+
+def checksum(address: str) -> str:
+    """EIP-55 casing (what the sequencer's JSON carries)."""
+    p = subprocess.run(["cast", "to-check-sum-address", address], capture_output=True, text=True, check=True)
+    return p.stdout.strip()
+
+
+def image_config(image) -> dict:
+    cfg = json.load(open(os.path.join(image, "config.json")))
+    return cfg.get("config", cfg)
+
+
+def image_has_range(image, label: str) -> bool:
+    cfg = image_config(image)
+    return any(d.get("label") == label for d in cfg.get("nvram", []) + cfg.get("flash_drive", []))
+
+
 @dataclass
 class Result:
     returncode: int
@@ -145,12 +234,18 @@ class Machine:
         return p
 
     def advance(self, payload: bytes, sender=USER, commit=True, check_root=True, timeout=600,
-                max_mcycle=None):
+                max_mcycle=None, block=None, raw=None):
+        """One input. `block` overrides the running block number (the sequencer tests choose the
+        inclusion blocks that frames cover); the next input continues after it. `raw` feeds a
+        ready-made EvmAdvance input (the bytes an InputBox InputAdded event carries) instead."""
         work = os.path.join(self.tmp, f"work-{self.runs}")
         self.runs += 1
         os.makedirs(work)
         new_image = os.path.join(work, "new_image")
-        raw = evm_advance(payload, sender, app=APP, block=self.block, index=self.index)
+        if block is not None:
+            self.block = block
+        if raw is None:
+            raw = evm_advance(payload, sender, app=APP, block=self.block, index=self.index)
         with open(os.path.join(work, f"input-{self.index}.bin"), "wb") as f:
             f.write(raw)
         fields = [
@@ -214,12 +309,24 @@ class Machine:
             res.reports.append(open(f, "rb").read())
         return res
 
-    def read_state_drive(self, image=None, length=64 * 1024 * 1024):
-        cfg = json.load(open(os.path.join(image or self.image, "config.json")))
-        cfg = cfg.get("config", cfg)
+    def read_range(self, label="state", image=None):
+        """The stored file of a labeled range plus its config entry."""
+        cfg = image_config(image or self.image)
         for d in cfg.get("nvram", []) + cfg.get("flash_drive", []):
-            if d.get("label") == "state" or d.get("length") == length:
+            if d.get("label") == label:
                 name = os.path.basename(d["backing_store"]["data_filename"])
                 return open(os.path.join(image or self.image, name), "rb"), d
-        raise FileNotFoundError("state range not found")
+        raise FileNotFoundError(f"range {label} not found")
+
+    def read_state_drive(self, image=None):
+        return self.read_range("state", image)
+
+    def state_bytes(self, image=None) -> bytes:
+        """The comparison bytes of the application: the whole `state` range, exactly the host
+        engine's dump (docs/sequencer.md)."""
+        f, _ = self.read_range("state", image)
+        try:
+            return f.read()
+        finally:
+            f.close()
 

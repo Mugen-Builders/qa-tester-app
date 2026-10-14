@@ -3,6 +3,8 @@
 
 #include "qatester/abi.h"
 #include "qatester/commands.h"
+#include "qatester/fee.h"
+#include "qatester/state.h"
 
 extern "C" {
 #include <libcma/parser.h>
@@ -20,6 +22,11 @@ extern "C" {
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace qatester {
 
@@ -100,12 +107,16 @@ uint64_t burn_cycles(uint64_t iterations) {
 struct Engine::Impl {
     Config cfg;
     Ledger ledger;
-    Progress prog;
-    uint64_t rejected_count{0};
-    uint64_t current_index{0};
+    MetaView meta;
+    NonceTable nonces;
+    bool scheduler_known{false};
+    uint64_t scheduler_next_nonce{0};
+    uint64_t scheduler_queued{0};
     bytes scratch;
 
-    Impl(Config c, const std::string &state_file, const std::string &ledger_file) : cfg(c), ledger(c, state_file, ledger_file) {}
+    explicit Impl(Config c, const std::string &state_file)
+        : cfg(c), ledger(c, state_file), meta{ledger.region_c()},
+          nonces(ledger.region_c() + META_PAGE_LENGTH, c.region_c_length - META_PAGE_LENGTH, meta) {}
 
     __attribute__((format(printf, 2, 3))) void log(const char *fmt, ...) {
         if (!cfg.log) {
@@ -242,12 +253,12 @@ struct Engine::Impl {
         }
         bool on_drive = ledger.is_accounts_drive_asset(asset);
         rep["accounts_drive"] = on_drive;
-        if (cfg.deposit_policy == DepositPolicy::RejectAll ||
-            (cfg.deposit_policy == DepositPolicy::RejectNonToken && !on_drive)) {
+        const auto policy = static_cast<DepositPolicy>(meta.deposit_policy());
+        if (policy == DepositPolicy::RejectAll || (policy == DepositPolicy::RejectNonToken && !on_drive)) {
             rep["credited"] = false;
             rep["error"] = "rejected by deposit policy";
             (void) report_json(sink, rep);
-            log("deposit rejected by policy %d", static_cast<int>(cfg.deposit_policy));
+            log("deposit rejected by policy %d", static_cast<int>(policy));
             return Completion::Reject;
         }
         AccountRef acc = AccountRef::of_wallet(depositor);
@@ -532,6 +543,7 @@ struct Engine::Impl {
                     return fail(sink, "setDepositPolicy: policy must be 0, 1 or 2");
                 }
                 cfg.deposit_policy = static_cast<DepositPolicy>(c.mode);
+                meta.set_deposit_policy(c.mode);
                 (void) report_json(sink, json{{"deposit_policy", c.mode}});
                 return Completion::Accept;
             case Cmd::WithdrawErc20Safe: {
@@ -583,11 +595,17 @@ struct Engine::Impl {
     // --- inspect ------------------------------------------------------------------------------
     json state_json() {
         bytes_view drive = ledger.accounts_drive();
-        return json{{"executed_input_count", prog.executed_input_count}, {"last_block", prog.last_block},
-            {"rejected_count", rejected_count}, {"deposit_policy", static_cast<int>(cfg.deposit_policy)},
-            {"state_backend", ledger.is_nvram() ? "nvram" : "file"},
-            {"accounts_drive_length", drive.size()},
+        json j{{"executed_input_count", meta.executed_input_count()},
+            {"last_block", meta.last_executed_safe_block()}, {"rejected_count", meta.rejected_count()},
+            {"deposit_policy", static_cast<int>(meta.deposit_policy())},
+            {"sequencer_address", to_hex(meta.sequencer())}, {"token", to_hex(meta.token())},
+            {"nonce_count", meta.nonce_count()},
+            {"state_backend", ledger.is_nvram() ? "nvram" : "file"}, {"accounts_drive_length", drive.size()},
             {"accounts_drive_keccak256", drive.empty() ? std::string("unavailable") : keccak_hex(drive)}};
+        if (scheduler_known) {
+            j["scheduler"] = json{{"next_batch_nonce", scheduler_next_nonce}, {"queued_directs", scheduler_queued}};
+        }
+        return j;
     }
 
     Completion handle_inspect(bytes_view payload, OutputSink &sink, TerminalArgs &term) {
@@ -671,6 +689,24 @@ struct Engine::Impl {
             uint64_t acc = burn_cycles(n);
             return emit_check(sink, report_json(sink, json{{"burned", n}, {"checksum", acc}}), "burn report");
         }
+        if (method == "ledger_getNonce") {
+            Address a;
+            if (!params.is_array() || params.empty() || !params[0].is_string() ||
+                !parse_address(params[0].get<std::string>(), a)) {
+                return fail(sink, "ledger_getNonce: params[0] must be an address");
+            }
+            U256 out = U256::from_u64(nonces.get(a));
+            return emit_check(sink, sink.report(bytes_view(out.b.data(), out.b.size())), "nonce report");
+        }
+        if (method == "qa_fee") {
+            uint64_t e = param_u64(0, 0);
+            U256 out;
+            if (e > 0xffffU || !fee::to_linear(static_cast<uint16_t>(e), out)) {
+                return fail(sink, "qa_fee: exponent above the representable maximum " +
+                    std::to_string(fee::max_exponent()));
+            }
+            return emit_check(sink, sink.report(bytes_view(out.b.data(), out.b.size())), "fee report");
+        }
         // libcma inspects: ledger_getBalance / ledger_getTotalSupply
         cmt_rollup_inspect_t ins{};
         ins.payload.length = payload.size();
@@ -723,13 +759,99 @@ struct Engine::Impl {
     }
 };
 
-Engine::Engine(Config cfg, const std::string &state_file, const std::string &ledger_file)
-    : m(std::make_unique<Impl>(cfg, state_file, ledger_file)) {}
+namespace {
+
+// Maps the state range just long enough to look at the meta page (a UIO range is always mapped
+// whole, at offset 0). `token` receives the pinned asset when the magic is present.
+bool peek_initialized(const Config &cfg, const std::string &state_path, Address *token = nullptr) {
+    struct stat st{};
+    if (::stat(state_path.c_str(), &st) != 0) {
+        throw OpenError(OpenErrorKind::NotFound, "state not found: " + state_path);
+    }
+    if (S_ISREG(st.st_mode) && static_cast<size_t>(st.st_size) < cfg.state_length()) {
+        return false; // too short to hold a genesis
+    }
+    int fd = ::open(state_path.c_str(), O_RDWR);
+    if (fd < 0) {
+        throw OpenError(OpenErrorKind::Io, "cannot open " + state_path + ": " + std::strerror(errno));
+    }
+    void *p = ::mmap(nullptr, cfg.state_length(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (p == MAP_FAILED) {
+        throw OpenError(OpenErrorKind::Io, "cannot map " + state_path + ": " + std::strerror(errno));
+    }
+    MetaView meta{static_cast<uint8_t *>(p) + cfg.region_c_offset()};
+    bool ok = meta.has_magic();
+    if (ok && token != nullptr) {
+        *token = meta.token();
+    }
+    ::munmap(p, cfg.state_length());
+    return ok;
+}
+
+} // namespace
+
+bool Engine::is_initialized(const Config &cfg, const std::string &state_path) {
+    return peek_initialized(cfg, state_path);
+}
+
+void Engine::genesis(const Config &cfg, const std::string &state_path, const Address &sequencer) {
+    struct stat st{};
+    if (::stat(state_path.c_str(), &st) != 0) {
+        // a regular file is created; devices must exist
+        int fd = ::open(state_path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) {
+            throw std::runtime_error("cannot create " + state_path + ": " + std::strerror(errno));
+        }
+        ::close(fd);
+    } else if (S_ISCHR(st.st_mode)) {
+        // A live UIO range: region B can be laid out exactly once per process (ledger.h), so the
+        // genesis only marks the meta page here and the first open lays out both ledgers. The
+        // bytes are the same as a file genesis: libcma's creation does not depend on the order.
+        int fd = ::open(state_path.c_str(), O_RDWR);
+        if (fd < 0) {
+            throw std::runtime_error("cannot open " + state_path + ": " + std::strerror(errno));
+        }
+        void *p = ::mmap(nullptr, cfg.state_length(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        ::close(fd);
+        if (p == MAP_FAILED) {
+            throw std::runtime_error("cannot map " + state_path + ": " + std::strerror(errno));
+        }
+        MetaView meta{static_cast<uint8_t *>(p) + cfg.region_c_offset()};
+        if (meta.has_magic()) {
+            ::munmap(p, cfg.state_length());
+            throw std::runtime_error("state already carries a genesis: " + state_path);
+        }
+        meta.initialize(static_cast<uint8_t>(cfg.deposit_policy), sequencer, cfg.token);
+        ::munmap(p, cfg.state_length());
+        return;
+    }
+    Ledger ledger(cfg, state_path); // grows the file, creates both libcma ledgers
+    MetaView meta{ledger.region_c()};
+    if (meta.has_magic()) {
+        throw std::runtime_error("state already carries a genesis: " + state_path);
+    }
+    meta.initialize(static_cast<uint8_t>(cfg.deposit_policy), sequencer, cfg.token);
+    ledger.flush();
+}
+
+Engine::Engine(Config cfg, const std::string &state_file) {
+    Address pinned;
+    if (!peek_initialized(cfg, state_file, &pinned)) {
+        throw OpenError(OpenErrorKind::InvalidDump, "state carries no genesis (meta page magic missing): " + state_file);
+    }
+    cfg.token = pinned; // the single-asset ledger's asset is whatever the genesis pinned
+    try {
+        m = std::make_unique<Impl>(cfg, state_file);
+    } catch (const std::runtime_error &e) {
+        throw OpenError(OpenErrorKind::InvalidDump, e.what());
+    }
+    m->cfg.deposit_policy = static_cast<DepositPolicy>(m->meta.deposit_policy());
+}
 Engine::~Engine() = default;
 
 Completion Engine::execute_direct_input(const DirectInput &input, OutputSink &sink, TerminalArgs &terminal) {
     terminal = TerminalArgs{};
-    m->current_index = input.index;
     Completion c = Completion::Reject;
     try {
         cma_parser_input_type_t kind = m->portal_kind(input.sender);
@@ -743,13 +865,77 @@ Completion Engine::execute_direct_input(const DirectInput &input, OutputSink &si
     } catch (...) {
         c = m->fail(sink, "internal error");
     }
-    if (c == Completion::Accept) {
-        m->prog.executed_input_count += 1;
-        m->prog.last_block = std::max(m->prog.last_block, input.block_number);
-    } else if (c == Completion::Reject) {
-        m->rejected_count += 1;
+    return c;
+}
+
+bool Engine::validate_user_op(const Address &sender, uint32_t nonce, uint16_t current_fee, UserOpInvalid &invalid) const {
+    invalid = UserOpInvalid{};
+    uint32_t expected = m->nonces.get(sender);
+    if (nonce != expected) {
+        invalid.reason = UserOpInvalid::Reason::Nonce;
+        invalid.expected = expected;
+        invalid.got = nonce;
+        return false;
+    }
+    U256 required;
+    bool representable = fee::to_linear(current_fee, required);
+    U256 available;
+    (void) m->ledger.balance(AccountRef::of_wallet(sender), AssetRef::erc20(m->cfg.token), available); // absent = 0
+    // a sender the nonce table cannot take is refused like an uncoverable fee (documented)
+    if (!representable || !m->nonces.can_insert(sender)) {
+        invalid.reason = UserOpInvalid::Reason::FeeBalance;
+        std::fill(invalid.required.b.begin(), invalid.required.b.end(), uint8_t{0xff});
+        invalid.available = available;
+        return false;
+    }
+    if (std::lexicographical_compare(available.b.begin(), available.b.end(), required.b.begin(), required.b.end())) {
+        invalid.reason = UserOpInvalid::Reason::FeeBalance;
+        invalid.required = required;
+        invalid.available = available;
+        return false;
+    }
+    return true;
+}
+
+Completion Engine::execute_user_op(const DirectInput &in, uint16_t fee, OutputSink &sink, TerminalArgs &terminal) {
+    terminal = TerminalArgs{};
+    U256 amount;
+    if (!fee::to_linear(fee, amount)) {
+        throw std::runtime_error("user op fee exponent is not representable");
+    }
+    Address seq = m->meta.sequencer();
+    if (!amount.is_zero() && !(in.sender == seq)) {
+        int rc = m->ledger.transfer(AccountRef::of_wallet(in.sender), AccountRef::of_wallet(seq),
+            AssetRef::erc20(m->cfg.token), amount);
+        if (rc != 0) {
+            throw std::runtime_error("validated user op cannot pay fee: " + m->ledger.last_error());
+        }
+    }
+    uint32_t nonce = m->nonces.get(in.sender);
+    if (nonce == UINT32_MAX || !m->nonces.set(in.sender, nonce + 1)) {
+        throw std::runtime_error("user op nonce cannot advance");
+    }
+    Completion c = Completion::Reject;
+    try {
+        c = m->run_payload(in, in.payload, sink, terminal, 0);
+    } catch (const std::exception &e) {
+        c = m->fail(sink, std::string("internal error: ") + e.what());
+    } catch (...) {
+        c = m->fail(sink, "internal error");
     }
     return c;
+}
+
+void Engine::commit_progress(uint64_t block) {
+    uint64_t count = m->meta.executed_input_count();
+    if (count == UINT64_MAX) {
+        throw std::runtime_error("executed input count overflow");
+    }
+    m->meta.set_progress(count + 1, std::max(m->meta.last_executed_safe_block(), block));
+}
+
+void Engine::note_reject() {
+    m->meta.set_rejected_count(m->meta.rejected_count() + 1);
 }
 
 Completion Engine::inspect(bytes_view payload, OutputSink &sink, TerminalArgs &terminal) {
@@ -764,7 +950,29 @@ Completion Engine::inspect(bytes_view payload, OutputSink &sink, TerminalArgs &t
 }
 
 Progress Engine::progress() const {
-    return m->prog;
+    return Progress{m->meta.executed_input_count(), m->meta.last_executed_safe_block()};
+}
+
+uint64_t Engine::rejected_count() const {
+    return m->meta.rejected_count();
+}
+
+uint32_t Engine::nonce_of(const Address &sender) const {
+    return m->nonces.get(sender);
+}
+
+Address Engine::sequencer() const {
+    return m->meta.sequencer();
+}
+
+Address Engine::token() const {
+    return m->meta.token();
+}
+
+void Engine::set_scheduler_status(uint64_t next_batch_nonce, uint64_t queued_directs) {
+    m->scheduler_known = true;
+    m->scheduler_next_nonce = next_batch_nonce;
+    m->scheduler_queued = queued_directs;
 }
 
 const Config &Engine::config() const {

@@ -7,16 +7,19 @@ The state is one 64 MiB NVRAM, `/dev/uio0` (`[nvrams.state]` in `cartesi.toml`),
 |---|---|---|
 | 0 … 4 MiB | **accounts drive**: 2^17 records of 32 bytes `[uint96 LE balance \| 20-byte address]` = `LibUsdAccount` encoding (`log2_max_num_of_accounts = 17`, `log2_leaves_per_account = 0`) | file-backed, create-or-open (`cma_ledger_init_single_file` on the device, offset 0) |
 | 4 … 32 MiB | single-asset ledger heap (account maps, virtual balances) + libcma's integrity footer | same region |
-| 32 … 64 MiB | multi-asset ledger for every other asset (Ether, other ERC-20s, ERC-721, ERC-1155) | buffer mode (`cma_ledger_init_buffer`) over a mapping of the whole NVRAM |
+| 32 … 60 MiB | multi-asset ledger for every other asset (Ether, other ERC-20s, ERC-721, ERC-1155), never withdrawable on-chain | file-mode layout: `cma_ledger_init_file` at this offset on the host; in the machine `cma_ledger_init_buffer` over the heap part plus the footer written by the app (a UIO range cannot be mapped at an offset) |
+| 60 MiB … +4 KiB | meta page: progress, rejected count, deposit policy, batch submitter, token, nonce count | the app's own ([sequencer.md](sequencer.md)) |
+| 60 MiB + 4 KiB … 64 MiB | user-op nonce table (32-byte slots) | the app's own |
 
-Why the split: a UIO device cannot be mapped at a byte offset (the mmap offset selects a map
-index; measured: `EINVAL` at offset 32 MiB), `/dev/mem` is closed by `CONFIG_IO_STRICT_DEVMEM`
-on the Cartesi kernel, so libcma's file-backed mode can only own the region at offset 0. The
-accounts drive region is therefore file-backed (readable and provable by libcma's reader tool from
-a stored image) and the tail runs in libcma's buffer mode, which has no footer: that half is
-readable only through the app's inspect API. On a plain file or a flash drive both regions are
-file-backed. Empty records are all-zero (libcma compacts on withdraw-to-zero) and the `uint96`
-balance width matches the contract's limit.
+Why region B is laid out this way: a UIO device cannot be mapped at a byte offset (the mmap offset
+selects a map index; measured: `EINVAL` at offset 32 MiB), `/dev/mem` is closed by
+`CONFIG_IO_STRICT_DEVMEM` on the Cartesi kernel, so libcma's file-backed mode can only own the
+region at offset 0 of the range; and libcma's buffer mode creates a fresh ledger on every init, so a
+host sequencer reopening a dump needs file mode. The app therefore reproduces file mode's bytes in
+the machine (buffer mode sized to the footer offset + the footer), which the host unit tests pin
+against libcma. The asset of region A is pinned in the meta page at genesis (the `config` range of
+the sequencer variant, `QA_TOKEN` otherwise). Empty records are all-zero (libcma compacts on
+withdraw-to-zero) and the `uint96` balance width matches the contract's limit.
 
 ## Read and prove the accounts drive of a stored snapshot
 
@@ -67,5 +70,5 @@ accounts drive.
 - `cartesi-rollups-machine-tool prove accounts-drive` only searches the stored machine's
   `flash_drive` list and reports `accounts drive not found` for an NVRAM range; the emulator proof
   above is the same object it would have produced.
-- A libcma init over a caller-mapped buffer with the file-mode footer would let the 32 … 64 MiB
-  tail be read by the tool as well (worth proposing upstream).
+- Region B (32 … 60 MiB) has libcma's file-mode layout: `account-driver-reader` could read it
+  with the multi-asset options at that offset of `000000008c000000-4000000.bin`.

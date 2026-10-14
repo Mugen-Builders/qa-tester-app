@@ -52,11 +52,10 @@ struct Ledger::Impl {
     bool single_ok{false};
     bool multi_ok{false};
     cma_ledger_asset_id_t ether_id{0};
-    uint8_t *drive_map{nullptr}; // view of the accounts drive prefix
+    uint8_t *drive_map{nullptr}; // view of the accounts drive prefix (= whole)
     size_t drive_map_len{0};
-    bool drive_map_owned{false}; // separate read-only mapping
     uint8_t *nvram{nullptr};     // non-null when the state path is a character device
-    uint8_t *whole{nullptr};     // single-NVRAM layout: mapping of the whole range (region B in buffer mode)
+    uint8_t *whole{nullptr};     // mapping of the whole state range
     size_t whole_len{0};
     std::string err;
 
@@ -164,13 +163,13 @@ static cma_amount_t to_amount(const U256 &v) {
     return a;
 }
 
-static void ensure_size(const std::string &path, size_t need) {
+// Grows a regular file to `need` bytes; devices (NVRAM /dev/uioN) have a fixed size that libcma
+// cannot query and trusts. Returns whether the path is a character device.
+static bool prepare_range(const std::string &path, size_t need) {
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0) {
         throw std::runtime_error("state file not found: " + path);
     }
-    // A regular file used by host tests is grown here; devices (NVRAM /dev/uioN, flash /dev/pmemN)
-    // have a fixed size that libcma cannot query and trusts.
     if (S_ISREG(st.st_mode) && static_cast<size_t>(st.st_size) < need) {
         int fd = ::open(path.c_str(), O_RDWR);
         if (fd < 0 || ::ftruncate(fd, static_cast<off_t>(need)) != 0) {
@@ -181,60 +180,90 @@ static void ensure_size(const std::string &path, size_t need) {
         }
         ::close(fd);
     }
+    return S_ISCHR(st.st_mode);
 }
 
-Ledger::Ledger(const Config &cfg, const std::string &state_file, const std::string &ledger_file)
+static uint8_t *map_range(const std::string &path, size_t offset, size_t length) {
+    int fd = ::open(path.c_str(), O_RDWR);
+    if (fd < 0) {
+        throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
+    }
+    void *p = ::mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, static_cast<off_t>(offset));
+    ::close(fd);
+    if (p == MAP_FAILED) {
+        throw std::runtime_error("cannot map " + path + ": " + std::strerror(errno));
+    }
+    return static_cast<uint8_t *>(p);
+}
+
+// libcma's MappedState footer (machine-asset-tools src/interprocess.hpp, v0.1.0-alpha.11): four u64
+// at (length - 32) & ~7 of a file-mode region: version 2, region length, static prefix length,
+// canary. The heap managed in front of it is sized to the footer offset. Buffer mode has no footer
+// and sizes the heap to the whole buffer, so a buffer of exactly `footer offset` bytes followed by
+// this footer is byte-identical to what file mode creates. tests/host/unit_tests.cpp checks that.
+struct RegionBFooter {
+    static constexpr uint64_t VERSION = 2;
+    static constexpr uint64_t END_CANARY = 0x8960528b5239c8a6ULL;
+    uint64_t version;
+    uint64_t memory_size;
+    uint64_t static_memory_size;
+    uint64_t end_canary;
+};
+static_assert(sizeof(RegionBFooter) == 32);
+
+static size_t region_b_footer_offset(const Config &cfg) {
+    return (cfg.region_b_length - sizeof(RegionBFooter)) & ~static_cast<size_t>(0x7);
+}
+
+static size_t region_b_static_length(const Config &cfg) {
+    return cfg.multi_balances * sizeof(cma_ledger_account_balance_t);
+}
+
+Ledger::Ledger(const Config &cfg, const std::string &state_path, bool emulate_nvram)
     : m(std::make_unique<Impl>()) {
     m->cfg = cfg;
-    m->path = state_file;
-    const bool same = ledger_file.empty() || ledger_file == state_file;
-    struct stat st{};
-    if (::stat(state_file.c_str(), &st) != 0) {
-        throw std::runtime_error("state file not found: " + state_file);
-    }
-    const bool uio = S_ISCHR(st.st_mode);
+    m->path = state_path;
+    const bool uio = prepare_range(state_path, cfg.state_length());
     m->nvram = uio ? reinterpret_cast<uint8_t *>(1) : nullptr;
 
-    ensure_size(state_file, same ? cfg.region_a_length + cfg.region_b_length : cfg.region_a_length);
-    if (!same) {
-        ensure_size(ledger_file, cfg.region_b_length);
-    }
-
-    // Region A (offset 0 of the state range): file-backed create-or-open, so a stored NVRAM image
-    // keeps libcma's footer and account-driver-reader can read and prove it unchanged.
+    // Region A (offset 0): file-backed create-or-open, so a stored NVRAM image keeps libcma's
+    // footer and account-driver-reader can read and prove it unchanged.
     cma_token_address_t token{};
     std::copy(cfg.token.b.begin(), cfg.token.b.end(), std::begin(token.data));
-    int rc = cma_ledger_init_single_file(&m->single, state_file.c_str(), 0, cfg.region_a_length, cfg.single_accounts,
+    int rc = cma_ledger_init_single_file(&m->single, state_path.c_str(), 0, cfg.region_a_length, cfg.single_accounts,
         CMA_LEDGER_ASSET_TYPE_TOKEN_ADDRESS, &token);
     if (rc != CMA_LEDGER_SUCCESS) {
         throw std::runtime_error(std::string("single ledger init: ") + cma_ledger_get_last_error_message());
     }
     m->single_ok = true;
 
-    // Region B (multi-asset ledger).
-    if (same && uio) {
-        // One NVRAM for everything. A UIO device cannot be mmap'ed at a byte offset (the offset selects
-        // a map index), so libcma's file mode cannot open the tail of the range: map the whole NVRAM
-        // once and run the multi-asset ledger in libcma's buffer mode on the slice after region A.
-        // Buffer mode has no footer, hence this half is not readable by account-driver-reader from a
-        // stored image; the accounts drive (region A) is unaffected.
-        int fd = ::open(state_file.c_str(), O_RDWR | O_SYNC);
-        if (fd < 0) {
-            throw std::runtime_error("cannot open NVRAM " + state_file + ": " + std::strerror(errno));
+    // Our own mapping of the whole range (region B in the machine, region C, the drive view).
+    m->whole_len = cfg.state_length();
+    m->whole = map_range(state_path, 0, m->whole_len);
+    m->drive_map = m->whole;
+    m->drive_map_len = cfg.accounts_drive_length();
+
+    // Region B: file mode at its offset on a regular file; on a UIO range the same layout from
+    // buffer mode over the heap part plus the footer written here (see RegionBFooter).
+    uint8_t *region_b = m->whole + cfg.region_a_length;
+    if (uio || emulate_nvram) {
+        auto *footer = reinterpret_cast<RegionBFooter *>(region_b + region_b_footer_offset(cfg));
+        const bool pristine = footer->version == 0 && footer->memory_size == 0 && footer->static_memory_size == 0 &&
+            footer->end_canary == 0;
+        if (!pristine) {
+            // buffer mode always creates a fresh ledger: a second open of a live range is a bug
+            throw std::runtime_error("region B already initialised: a UIO range cannot be reopened");
         }
-        m->whole_len = cfg.region_a_length + cfg.region_b_length;
-        void *p = ::mmap(nullptr, m->whole_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        ::close(fd);
-        if (p == MAP_FAILED) {
-            m->whole_len = 0;
-            throw std::runtime_error("cannot map NVRAM " + state_file + ": " + std::strerror(errno));
-        }
-        m->whole = static_cast<uint8_t *>(p);
-        rc = cma_ledger_init_buffer(&m->multi, m->whole + cfg.region_a_length, cfg.region_b_length, cfg.multi_accounts,
+        rc = cma_ledger_init_buffer(&m->multi, region_b, region_b_footer_offset(cfg), cfg.multi_accounts,
             cfg.multi_assets, cfg.multi_balances);
+        if (rc == CMA_LEDGER_SUCCESS) {
+            footer->version = RegionBFooter::VERSION;
+            footer->memory_size = cfg.region_b_length;
+            footer->static_memory_size = region_b_static_length(cfg);
+            footer->end_canary = RegionBFooter::END_CANARY;
+        }
     } else {
-        const std::string &lpath = same ? state_file : ledger_file;
-        rc = cma_ledger_init_file(&m->multi, lpath.c_str(), same ? cfg.region_a_length : 0, cfg.region_b_length,
+        rc = cma_ledger_init_file(&m->multi, state_path.c_str(), cfg.region_a_length, cfg.region_b_length,
             cfg.multi_accounts, cfg.multi_assets, cfg.multi_balances);
     }
     if (rc != CMA_LEDGER_SUCCESS) {
@@ -248,25 +277,6 @@ Ledger::Ledger(const Config &cfg, const std::string &state_file, const std::stri
     if (rc != CMA_LEDGER_SUCCESS) {
         throw std::runtime_error(std::string("ether asset: ") + cma_ledger_get_last_error_message());
     }
-
-    // View of the accounts drive prefix (offset 0 of the state range), for state reports.
-    if (m->whole != nullptr) {
-        m->drive_map = m->whole;
-        m->drive_map_len = cfg.accounts_drive_length();
-    } else {
-        int fd = ::open(state_file.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            m->drive_map_len = cfg.accounts_drive_length();
-            void *p = ::mmap(nullptr, m->drive_map_len, PROT_READ, MAP_SHARED, fd, 0);
-            ::close(fd);
-            if (p != MAP_FAILED) {
-                m->drive_map = static_cast<uint8_t *>(p);
-                m->drive_map_owned = true;
-            } else {
-                m->drive_map_len = 0;
-            }
-        }
-    }
 }
 
 Ledger::~Ledger() {
@@ -275,9 +285,6 @@ Ledger::~Ledger() {
     }
     if (m->single_ok) {
         (void) cma_ledger_fini(&m->single);
-    }
-    if (m->drive_map_owned && m->drive_map != nullptr) {
-        ::munmap(m->drive_map, m->drive_map_len);
     }
     if (m->whole != nullptr) {
         ::munmap(m->whole, m->whole_len);
@@ -409,12 +416,20 @@ bytes_view Ledger::accounts_drive() const {
     return bytes_view(m->drive_map, m->drive_map_len);
 }
 
+uint8_t *Ledger::region_c() {
+    return m->whole + m->cfg.region_c_offset();
+}
+
 bool Ledger::is_nvram() const {
     return m->nvram != nullptr;
 }
 
 void Ledger::flush() {
-    // libcma syncs its mapping after every mutating call; an NVRAM has no page cache anyway.
+    // libcma syncs its own mappings after every mutating call; region C is ours. An NVRAM has no
+    // page cache, so this only matters for a file on the host.
+    if (m->nvram == nullptr && m->whole != nullptr) {
+        (void) ::msync(m->whole, m->whole_len, MS_SYNC);
+    }
 }
 
 } // namespace qatester

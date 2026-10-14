@@ -14,9 +14,16 @@ MAX_OUTPUT = 4 + 32 + 32 + MAX_NOTICE  # 2,097,124 bytes: selector + offset + le
 TX_BUFFER = 2 * 1024 * 1024
 
 
+IMAGE = os.environ.get("QA_IMAGE", str(h.ROOT / ".cartesi" / "image"))
+
+
 @pytest.fixture(scope="module")
 def m():
-    machine = h.Machine()
+    if not os.path.isdir(IMAGE):
+        pytest.skip(f"no stored machine at {IMAGE} (cartesi build)")
+    if h.image_has_range(IMAGE, "config"):
+        pytest.skip(f"{IMAGE} is the sequencer variant (test_seq_machine.py covers it)")
+    machine = h.Machine(image=IMAGE)
     yield machine
     machine.close()
 
@@ -182,7 +189,7 @@ def test_inspect_state_and_echo_and_exception(m):
     (("corruptOutputsRoot", 2), "expected outputs Merkle root in tx buffer"),
 ])
 def test_terminal_outcomes(command, marker):
-    fresh = h.Machine()
+    fresh = h.Machine(image=IMAGE)
     try:
         r = fresh.advance(h.cmd(*command), commit=False)
         assert not r.accepted
@@ -192,7 +199,7 @@ def test_terminal_outcomes(command, marker):
 
 
 def test_corrupt_root_after_outputs_keeps_the_outputs_visible():
-    fresh = h.Machine()
+    fresh = h.Machine(image=IMAGE)
     try:
         calls = [h.cmd("emitVouchers", 1, "0x" + "42" * 20, 0, b""), h.cmd("emitNotice", b"\x02"),
                  h.cmd("corruptOutputsRoot", 0)]
@@ -204,7 +211,7 @@ def test_corrupt_root_after_outputs_keeps_the_outputs_visible():
 
 
 def test_burn_cycles_grows_mcycle():
-    fresh = h.Machine()
+    fresh = h.Machine(image=IMAGE)
     try:
         r0 = fresh.advance(h.cmd("burnCycles", 1000, 0), commit=False)
         r1 = fresh.advance(h.cmd("burnCycles", 20_000_000, 1), commit=False)

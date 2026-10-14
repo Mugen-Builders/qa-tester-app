@@ -1,5 +1,6 @@
 // qa-tester: rollup driver. Owns the rollup device (libcmt) and nothing else; every decision is
 // made by qatester::Engine. See README.md for the command catalog and the terminal-state recipes.
+#include "cmt_sink.h"
 #include "qatester/config.h"
 #include "qatester/engine.h"
 #include "qatester/sink.h"
@@ -41,57 +42,6 @@ __attribute__((format(printf, 1, 2))) void logf(const char *fmt, ...) {
     std::fprintf(stderr, "\n");
     va_end(ap);
 }
-
-// Streams engine emissions straight into the rollup device.
-class CmtSink final : public OutputSink {
-public:
-    explicit CmtSink(cmt_rollup_t *r) : m_r(r) {}
-
-    int notice(bytes_view payload) override {
-        cmt_abi_bytes_t b{payload.size(), const_cast<uint8_t *>(payload.data())};
-        return cmt_rollup_emit_notice(m_r, &b, nullptr);
-    }
-    int voucher(const Address &destination, const U256 &value, bytes_view payload) override {
-        cmt_abi_address_t a{};
-        cmt_abi_u256_t v{};
-        std::memcpy(a.data, destination.b.data(), 20);
-        std::memcpy(v.data, value.b.data(), 32);
-        cmt_abi_bytes_t b{payload.size(), const_cast<uint8_t *>(payload.data())};
-        return cmt_rollup_emit_voucher(m_r, &a, &v, &b, nullptr);
-    }
-    int delegate_call_voucher(const Address &destination, bytes_view payload) override {
-        cmt_abi_address_t a{};
-        std::memcpy(a.data, destination.b.data(), 20);
-        cmt_abi_bytes_t b{payload.size(), const_cast<uint8_t *>(payload.data())};
-        return cmt_rollup_emit_delegate_call_voucher(m_r, &a, &b, nullptr);
-    }
-    // An output with arbitrary bytes: written to the TX buffer as-is and accounted in the outputs
-    // Merkle tree exactly like libcmt does for vouchers and notices.
-    int raw_output(bytes_view output) override {
-        cmt_buf_t tx = cmt_io_get_tx(m_r->io);
-        if (output.size() > cmt_buf_length(&tx)) {
-            return -ENOBUFS;
-        }
-        std::memcpy(tx.begin, output.data(), output.size());
-        cmt_io_yield_t req{HTIF_DEVICE_YIELD, HTIF_YIELD_CMD_AUTOMATIC, HTIF_YIELD_AUTOMATIC_REASON_TX_OUTPUT,
-            static_cast<uint32_t>(output.size())};
-        int rc = cmt_io_yield(m_r->io, &req);
-        if (rc != 0) {
-            return rc;
-        }
-        return cmt_merkle_push_back_data(m_r->merkle, output.size(), tx.begin);
-    }
-    int report(bytes_view payload) override {
-        cmt_abi_bytes_t b{payload.size(), const_cast<uint8_t *>(payload.data())};
-        return cmt_rollup_emit_report(m_r, &b);
-    }
-    void progress(uint32_t value) override {
-        (void) cmt_rollup_progress(m_r, value);
-    }
-
-private:
-    cmt_rollup_t *m_r;
-};
 
 void save_merkle(cmt_rollup_t *r) {
     mode_t old = umask(0000);
@@ -189,26 +139,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     g_log = cfg.log;
-    // argv: [state range] [ledger range]. In the machine the state range is the `state` NVRAM
-    // (/dev/uio0, see cartesi.toml) and holds both ledger regions; a flash drive or a plain file works
-    // the same way, and a second path moves the multi-asset region elsewhere.
+    // argv: [state range]. In the machine it is the `state` NVRAM (/dev/uio0, see cartesi.toml);
+    // on the host a plain file. A blank state gets its genesis on the first boot.
     const char *state = argc > 1 ? argv[1] : std::getenv("QA_STATE_DEVICE");
     if (state == nullptr || *state == '\0') {
         state = "/dev/uio0";
-    }
-    const char *ledger = argc > 2 ? argv[2] : std::getenv("QA_LEDGER_DEVICE");
-    if (ledger == nullptr) {
-        ledger = ""; // same range as the state, after the state region
     }
     if (const char *mp = std::getenv("QA_MERKLE_PATH"); mp != nullptr && *mp != '\0') {
         g_merkle_path = mp;
     }
     logf("config %s", cfg.describe_json().c_str());
-    logf("state range %s, ledger range %s", state, *ledger ? ledger : state);
+    logf("state range %s", state);
 
     Engine *engine = nullptr;
     try {
-        engine = new Engine(cfg, state, ledger);
+        if (!Engine::is_initialized(cfg, state)) {
+            logf("blank state: writing the genesis");
+            Engine::genesis(cfg, state, Address{});
+        }
+        engine = new Engine(cfg, state);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "[qa-tester] unable to initialise the ledger: %s\n", e.what());
         return 1;
@@ -308,6 +257,12 @@ int main(int argc, char *argv[]) {
             logf("advance #%llu from %s (%zu bytes)", static_cast<unsigned long long>(adv.index),
                 to_hex(in.sender).c_str(), in.payload.size());
             pending = engine->execute_direct_input(in, sink, term);
+            if (pending == Completion::Accept) {
+                engine->commit_progress(in.block_number);
+            } else if (pending == Completion::Reject) {
+                engine->note_reject();
+            }
+            engine->flush();
             sync();
             logf("advance #%llu completion %d", static_cast<unsigned long long>(adv.index), static_cast<int>(pending));
         } else if (next_type == HTIF_YIELD_REASON_INSPECT_STATE) {

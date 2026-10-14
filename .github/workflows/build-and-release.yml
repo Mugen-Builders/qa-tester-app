@@ -4,9 +4,12 @@ on: [push, workflow_dispatch]
 
 # Pins (override with repository variables of the same name):
 #   EMULATOR_VERSION 0.21.0, MACHINE_LINUX_VERSION 0.21.0, KERNEL_VERSION 6.5.13-ctsi-2,
-#   XGENEXT2_VERSION 1.5.6-1, CARTESI_CLI_VERSION 2.0.0-alpha.38, FOUNDRY_VERSION v1.4.3
+#   XGENEXT2_VERSION 1.5.6-1, CARTESI_CLI_VERSION 2.0.0-alpha.38, FOUNDRY_VERSION v1.4.3,
+#   RUST_VERSION 1.95.0 (seq/rust-toolchain.toml; the Cartesi sequencer v0.1.0-alpha.10 pin)
 # Foundry's `cast` encodes every test input (docs/inputs.md); the CLI builds, boots and stores the
-# template with the state NVRAM declared in cartesi.toml (docs/build.md).
+# templates with the NVRAMs declared in cartesi.toml / cartesi-seq.toml (docs/build.md,
+# docs/sequencer.md). Both variants share .cartesi/, so the classic image is archived before the
+# sequencer build runs. The devnet kit (docs/sequencer-kit.md) is packed at the end.
 jobs:
   host-tests:
     # libqatester against the libcmt mock and libcma built from source: no machine needed.
@@ -17,18 +20,45 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends g++-14 make git curl
+          sudo apt-get install -y --no-install-recommends g++-14 make git curl jq xxd libclang-dev cmake pkg-config
+
+      - name: Install Rust (the sequencer crates)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ vars.RUST_VERSION || '1.95.0' }}
+          targets: riscv64gc-unknown-linux-musl
 
       - name: Install Foundry (cast encodes the mock e2e inputs)
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: ${{ vars.FOUNDRY_VERSION || 'v1.4.3' }}
 
-      - name: Build dependencies (machine-guest-tools, machine-asset-tools)
-        run: make deps CXX=g++-14 CC=gcc-14
+      - name: Build dependencies (machine-guest-tools, machine-asset-tools, devnet state, crates)
+        run: make deps seq-deps CXX=g++-14 CC=gcc-14
 
       - name: Unit tests and mock-rollup e2e
         run: make host-test CXX=g++-14
+
+      - name: Sequencer host binary and fold tests (docs/sequencer.md)
+        run: |
+          make seq-host seq-test seq-guest-lib CXX=g++-14
+          seq/target/release/qa-tester-sequencer --help | head -3
+          build/host/qa-tester-genesis --help || true
+
+      - name: Package the host binaries
+        run: |
+          mkdir -p dist && cp seq/target/release/qa-tester-sequencer build/host/qa-tester-genesis dist/
+          tar -C dist -czf qa-tester-sequencer-linux-amd64.tar.gz qa-tester-sequencer qa-tester-genesis
+          sha256sum qa-tester-sequencer-linux-amd64.tar.gz > qa-tester-sequencer-linux-amd64.tar.gz.sha256
+
+      - name: Upload host binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: qa-tester-sequencer-host
+          path: |
+            qa-tester-sequencer-linux-amd64.tar.gz
+            qa-tester-sequencer-linux-amd64.tar.gz.sha256
+          retention-days: 2
 
   build-and-test:
     runs-on: ubuntu-24.04
@@ -44,7 +74,7 @@ jobs:
           curl -s -L https://cartesi.github.io/linux-packages/apt/keys/cartesi-deb-key.gpg.bin | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/cartesi-deb-key.gpg
           curl -s -L https://cartesi.github.io/linux-packages/apt/stable/sources.list | sudo tee /etc/apt/sources.list.d/cartesi-deb-apt.list
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends squashfs-tools \
+          sudo apt-get install -y --no-install-recommends squashfs-tools g++-14 jq xxd libclang-dev cmake pkg-config \
             xgenext2fs=${{ vars.XGENEXT2_VERSION || '1.5.6-1' }}
 
           curl -fsSL -o ${{ runner.temp }}/cartesi-machine.deb https://github.com/cartesi/machine-emulator/releases/download/v${{ vars.EMULATOR_VERSION || '0.21.0' }}/machine-emulator_amd64.deb
@@ -87,7 +117,17 @@ jobs:
         with:
           version: ${{ vars.FOUNDRY_VERSION || 'v1.4.3' }}
 
-      - name: Build drives, boot and store the template (with the state NVRAM)
+      - name: Install Rust (the sequencer host binary for the e2e test)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ vars.RUST_VERSION || '1.95.0' }}
+
+      - name: Host binaries (qa-tester-genesis, qa-tester-sequencer) and the devnet state
+        run: |
+          make deps seq-deps CXX=g++-14 CC=gcc-14
+          make host seq-host CXX=g++-14
+
+      - name: Build drives, boot and store the classic template (with the state NVRAMs)
         run: cartesi build --verbose
 
       - name: Template hash and flash drives
@@ -102,17 +142,63 @@ jobs:
           printf 'state NVRAM start %#x -> accounts_drive_start_index %d (cartesi.toml: %d)\n' "$start" $((start >> 22)) "$index"
           test $((start >> 22)) -eq "$index"
 
-      - name: Machine tests
+      - name: Machine tests (classic)
         run: |
           pip3 install --user pytest
           python3 -m pytest tests/machine -v
 
-      - name: Create artifact archive
+      - name: Create the classic artifact archive
         run: |
           cd .cartesi/image && tar -czf ../../qa-tester-snapshot.tar.gz * && cd ../..
           sha256sum qa-tester-snapshot.tar.gz > qa-tester-snapshot.tar.gz.sha256
           cp .cartesi/app.sqfs qa-tester-app.sqfs
           sha256sum qa-tester-app.sqfs > qa-tester-app.sqfs.sha256
+
+      # ---------------------------------------------------------------- sequencer variant
+      - name: Build, boot and store the sequencer template (docs/sequencer.md)
+        # the classic image shares .cartesi/; it was archived above
+        run: |
+          rm -rf .cartesi/image
+          make seq-image
+          cartesi hash
+          sha256sum .cartesi/app.sqfs
+
+      - name: Check the ranges (state index 560, config range after the state)
+        run: |
+          start=$(jq -r '(.config // .).nvram[] | select(.label == "state") | .start' .cartesi/image/config.json)
+          index=$(grep -oP 'accounts_drive_start_index\s*=\s*\K\d+' cartesi-seq.toml)
+          cfgstart=$(jq -r '(.config // .).nvram[] | select(.label == "config") | .start' .cartesi/image/config.json)
+          printf 'state %#x -> index %d (cartesi-seq.toml: %d); config range at %#x\n' "$start" $((start >> 22)) "$index" "$cfgstart"
+          test $((start >> 22)) -eq "$index"
+
+      - name: Cycle-0 image reproduces the template
+        run: |
+          make seq-cycle0
+          cartesi-machine --load=build/seq/cycle0 --assert-rolling-template --final-hash --store=build/seq/verify | tee build/seq/verify.log
+          booted=$(grep -oE '[0-9a-f]{64}' build/seq/verify.log | tail -1)
+          stored=$(cartesi-machine-stored-hash .cartesi/image | sed 's/^0x//')
+          echo "booted cycle-0: $booted"; echo "cartesi build:  $stored"
+          test "$booted" = "$stored"
+
+      - name: Machine tests (sequencer)
+        run: python3 -m pytest tests/machine/test_seq_machine.py -v
+
+      - name: End-to-end test (anvil, host sequencer, machine replay)
+        run: python3 -m pytest tests/sequencer -v
+
+      - name: Create the sequencer artifact archives
+        run: |
+          cd .cartesi/image && tar -czf ../../qa-tester-seq-genesis-devnet.tar.gz * && cd ../..
+          cd build/seq/cycle0 && tar -czf ../../../qa-tester-seq-cycle0.tar.gz * && cd ../../..
+          cp .cartesi/app.sqfs qa-tester-seq-app.sqfs
+          sha256sum qa-tester-seq-genesis-devnet.tar.gz > qa-tester-seq-genesis-devnet.tar.gz.sha256
+          sha256sum qa-tester-seq-cycle0.tar.gz > qa-tester-seq-cycle0.tar.gz.sha256
+          sha256sum qa-tester-seq-app.sqfs > qa-tester-seq-app.sqfs.sha256
+
+      - name: Package the devnet kit (docs/sequencer-kit.md)
+        run: |
+          make seq-kit
+          cp build/qa-tester-seq-devnet-linux-x86_64.tar.gz build/qa-tester-seq-devnet-linux-x86_64.tar.gz.sha256 .
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
@@ -123,7 +209,15 @@ jobs:
             qa-tester-snapshot.tar.gz.sha256
             qa-tester-app.sqfs
             qa-tester-app.sqfs.sha256
-          retention-days: 2
+            qa-tester-seq-genesis-devnet.tar.gz
+            qa-tester-seq-genesis-devnet.tar.gz.sha256
+            qa-tester-seq-cycle0.tar.gz
+            qa-tester-seq-cycle0.tar.gz.sha256
+            qa-tester-seq-app.sqfs
+            qa-tester-seq-app.sqfs.sha256
+            qa-tester-seq-devnet-linux-x86_64.tar.gz
+            qa-tester-seq-devnet-linux-x86_64.tar.gz.sha256
+          retention-days: 30
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

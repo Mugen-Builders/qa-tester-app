@@ -31,7 +31,7 @@ Deposits go through the portals, never through `addInput` directly:
 
 ```sh
 cartesi deposit erc20 --token $TOKEN --amount 1000000 --exec-layer-data 0xdeadbeef
-cast send $ERC20_PORTAL 'depositERC20Tokens(address,address,uint256,bytes)' $TOKEN $APP 1000000 0xdeadbeef --private-key $PK
+cast send $ERC20_PORTAL 'depositErc20Tokens(address,address,uint256,bytes)' $TOKEN $APP 1000000 0xdeadbeef --private-key $PK
 ```
 
 When feeding the machine directly (the tests, `cartesi-machine --cmio-advance-state`), the portal
@@ -85,12 +85,22 @@ curl -s -X POST http://localhost:6751/inspect/$APP -d '{"method":"ledger_getBala
 ```
 
 `ledger_getBalance [account, token?, tokenId?]` and `ledger_getTotalSupply [token?, tokenId?]`
-(libcma; 32-byte big-endian report), `qa_info` (config, selectors, counters), `qa_state`,
+(libcma; 32-byte big-endian report), `ledger_getNonce [address]` (the user-op nonce the engine
+expects, 32-byte big-endian), `qa_fee [exponent]` (the sequencer fee `fee::to_linear(exponent)` in
+token units, 32-byte big-endian), `qa_info` (config, selectors, counters), `qa_state`,
 `qa_echo [hex]`, `qa_reports [count, size, pattern]`, `qa_exception [hex]` (INS-008), `qa_reject`,
 `qa_burn [iterations]`. A non-JSON payload is echoed back as one report (INS-001: a full 2 MiB
-query); the raw payload `state` (the sequencer's `STATE_INSPECT_QUERY`) returns progress plus the
-keccak of the accounts drive. `ledger_getBalance` for an account the ledger has never seen rejects
-the inspect with `Account not found` (libcma semantics, as in the sample wallet).
+query); the raw payload `state` (the sequencer's `STATE_INSPECT_QUERY`) returns progress, the
+deposit policy, the pinned sequencer address and token, the nonce count, the keccak of the accounts drive and,
+in the sequencer variant, `scheduler.next_batch_nonce` / `scheduler.queued_directs`.
+`ledger_getBalance` for an account the ledger has never seen rejects the inspect with `Account not
+found` (libcma semantics, as in the sample wallet).
+
+## Sequencer variant
+
+Under the scheduler every input above is a **direct input** that executes when a batch frame
+covers its block (or when it is overdue), rejections and terminal commands become counted no-ops,
+and signed user ops carry the same command payloads: [sequencer.md](sequencer.md).
 
 ## Terminal states: what to expect on the node
 
