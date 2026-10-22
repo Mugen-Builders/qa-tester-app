@@ -9,7 +9,8 @@ in an **accounts drive** the v3 contracts can prove for emergency withdrawals.
 
 It exists to run Track A/B of the QA cycle (catalog
 [`Mugen-Builders/cartesi-qa`](https://github.com/Mugen-Builders/cartesi-qa)) against the pinned
-stack: node `v2.0.0-alpha.13`, contracts `v3.0.0-alpha.10`, emulator `0.21.0`, Cartesi CLI
+stack: contracts `v3.0.0-alpha.10`, **emulator `0.22.0`** (Dave `v3.0.0-alpha.6` generation; the
+reference node `v2.0.0-alpha.13` still loads only `0.21` images), Cartesi CLI
 `2.0.0-alpha.38` (SDK `0.12.0-alpha.44`), libcma (machine-asset-tools) `v0.1.0-alpha.11`,
 machine-guest-tools `0.18.0`.
 
@@ -50,7 +51,7 @@ docs/                      how to build, send inputs and prove the accounts driv
 ```sh
 make deps && make host-test        # host: 159 unit checks + mock e2e (needs g++ 14, cast)
 cartesi build && cartesi hash      # template with the state NVRAM (needs Docker + Cartesi CLI)
-pytest tests/machine -v            # 24 machine tests (needs cartesi-machine 0.21.0, cast)
+pytest tests/machine -v            # 24 machine tests (needs cartesi-machine 0.22.0, cast)
 cartesi run --epoch-length 10 --claim-staging-period 0
 ```
 

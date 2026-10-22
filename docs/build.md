@@ -8,7 +8,7 @@ Everything here uses the Cartesi CLI, `cartesi-machine` and `jq`. There are no h
 |---|---|---|
 | Docker with `linux/riscv64` emulation (`docker/setup-qemu-action` on CI, `binfmt` locally) | any recent | `cartesi build` builds the drives from the `Dockerfile` |
 | Cartesi CLI | `2.0.0-alpha.38` (`npm i -g @cartesi/cli@2.0.0-alpha.38`) | build, hash, run, send, deposit, address-book |
-| `cartesi-machine` + kernel | emulator `0.21.0`, `linux-6.5.13-ctsi-2-v0.21.0` (the SDK `0.12.0-alpha.44` pair) | only for `tests/machine` and manual snapshot work; the CLI boots through the SDK image otherwise |
+| `cartesi-machine` + kernel | emulator `0.22.0` (stores archive version 8; `0.21` nodes cannot load it), `linux-6.5.13-ctsi-2-v0.21.0` (the SDK `0.12.0-alpha.44` pair; the kernel is unchanged in 0.22) | only for `tests/machine` and manual snapshot work; the CLI boots through the SDK image otherwise |
 | Foundry `cast` | `1.4.x` | encoding inputs ([inputs.md](inputs.md)) and the tests |
 | `jq` | any | the accounts-drive index check below |
 
@@ -24,8 +24,10 @@ range with no page cache and no filesystem), so a plain `cartesi build` produces
 already contains the state range. The emulator places the NVRAM after the last flash drive, aligned
 to its own length: with the current root and app drives it lands at `0x8c000000`.
 
-Template hash with the pinned stack (2026-10-09, `cartesi build` with CLI 2.0.0-alpha.38, libcma
-alpha.11): `0x8e4f27b67edb41b0da389e5de1e6506b19be693bae28a61e812a104834be8c68`
+Template hash with emulator `0.21.0` (2026-10-09, `cartesi build` with CLI 2.0.0-alpha.38, libcma
+alpha.11): `0x8e4f27b67edb41b0da389e5de1e6506b19be693bae28a61e812a104834be8c68`. Cartesi Machine v0.22
+changes every machine hash (new pristine uarch, archive version 8), so the `0.22.0` build has a
+different hash; the release assets record it
 (`app.sqfs` sha256 `c0d022a7…92eac`, byte-identical to the libcma alpha.10 build). The hash of the
 earlier hand-booted template differed only because the CLI quotes the `[machine.env]` exports in the
 machine's init script; `cartesi build` is the reference from now on.
@@ -89,7 +91,7 @@ pytest tests/machine -v     # drives .cartesi/image with the host cartesi-machin
 ## Release artifacts (CI)
 
 `.github/workflows/build-and-release.yml`: `host-tests` runs `make deps` + `make host-test` with
-g++-14; `build-and-test` installs emulator `0.21.0`, the matching kernel, xgenext2fs/mksquashfs,
+g++-14; `build-and-test` installs emulator `0.22.0`, the matching kernel, xgenext2fs/mksquashfs,
 Foundry and the Cartesi CLI, runs `cartesi build`, `cartesi hash`, the index check above and the
 machine tests, then uploads `qa-tester-snapshot.tar.gz` (the stored template) and
 `qa-tester-app.sqfs` with sha256 files; `release` attaches them to a GitHub pre-release on `v*`

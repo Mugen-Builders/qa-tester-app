@@ -3,7 +3,7 @@ run-name: Testing and Releasing the QA tester application
 on: [push, workflow_dispatch]
 
 # Pins (override with repository variables of the same name):
-#   EMULATOR_VERSION 0.21.0, MACHINE_LINUX_VERSION 0.21.0, KERNEL_VERSION 6.5.13-ctsi-2,
+#   EMULATOR_VERSION 0.22.0, MACHINE_LINUX_VERSION 0.21.0, KERNEL_VERSION 6.5.13-ctsi-2,
 #   XGENEXT2_VERSION 1.5.6-1, CARTESI_CLI_VERSION 2.0.0-alpha.38, FOUNDRY_VERSION v1.4.3
 # Foundry's `cast` encodes every test input (docs/inputs.md); the CLI builds, boots and stores the
 # template with the state NVRAM declared in cartesi.toml (docs/build.md).
@@ -47,7 +47,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends squashfs-tools \
             xgenext2fs=${{ vars.XGENEXT2_VERSION || '1.5.6-1' }}
 
-          curl -fsSL -o ${{ runner.temp }}/cartesi-machine.deb https://github.com/cartesi/machine-emulator/releases/download/v${{ vars.EMULATOR_VERSION || '0.21.0' }}/machine-emulator_amd64.deb
+          curl -fsSL -o ${{ runner.temp }}/cartesi-machine.deb https://github.com/cartesi/machine-emulator/releases/download/v${{ vars.EMULATOR_VERSION || '0.22.0' }}/machine-emulator_amd64.deb
           sudo apt-get install -y --no-install-recommends ${{ runner.temp }}/cartesi-machine.deb
 
           curl -fsSL -o ${{ runner.temp }}/linux.bin https://github.com/cartesi/machine-linux-image/releases/download/v${{ vars.MACHINE_LINUX_VERSION || '0.21.0' }}/linux-${{ vars.KERNEL_VERSION || '6.5.13-ctsi-2' }}-v${{ vars.MACHINE_LINUX_VERSION || '0.21.0' }}.bin
