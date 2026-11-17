@@ -13,8 +13,8 @@ host inside the sequencer binary ([docs/sequencer.md](docs/sequencer.md)).
 
 It exists to run Track A/B of the QA cycle (catalog
 [`Mugen-Builders/cartesi-qa`](https://github.com/Mugen-Builders/cartesi-qa)) against the pinned
-stack: node `v2.0.0-alpha.13`, contracts `v3.0.0-alpha.10`, emulator `0.21.0`, Cartesi CLI
-`2.0.0-alpha.38` (SDK `0.12.0-alpha.44`), libcma (machine-asset-tools) `v0.1.0-alpha.11`,
+stack: node `v2.0.0-alpha.14`, contracts `v3.0.0-alpha.10`, emulator `0.22.0`, Cartesi CLI
+`2.0.0-alpha.42` (SDK `0.12.0-alpha.45`), libcma (machine-asset-tools) `v0.1.0-alpha.11`,
 machine-guest-tools `0.18.0`.
 
 It is modelled on [`machine-asset-tools/sample_apps/wallet_app`](https://github.com/Mugen-Builders/machine-asset-tools)
@@ -30,7 +30,7 @@ drained out, the state in two memory ranges, `(count, clock)` progress in the st
 No helper scripts: every job is done with the provided tools, and the docs say how.
 
 - [docs/build.md](docs/build.md): prerequisites, `cartesi build`/`hash`/`run`, the state NVRAM and
-  the `accounts_drive_start_index` check, addresses and `QA_*` environment, CI and release artifacts.
+  the derived withdrawal config, addresses and `QA_*` environment, CI and release artifacts.
 - [docs/inputs.md](docs/inputs.md): encoding inputs with `cast`, sending them, deposits, the full
   command catalog, inspect methods, terminal states on the node.
 - [docs/accounts-drive.md](docs/accounts-drive.md): ledger layout, reading and proving the accounts
@@ -44,7 +44,7 @@ No helper scripts: every job is done with the provided tools, and the docs say h
 ## Layout
 
 ```
-cartesi.toml               Cartesi CLI config (classic): drives root/app, [nvrams.state], machine env, [withdrawal.config]
+cartesi.toml               Cartesi CLI config (classic): drives root/app, [nvrams.state] (the accounts drive), machine env, [withdrawal]
 cartesi-seq.toml           Cartesi CLI config (sequencer): [drives.app] -> app-seq target, [nvrams.config], the qa-tester-seq entrypoint
 Dockerfile                 base (alpine + guest tools 0.18.0) / seq-rust (fold cross-build) / builder / app, app-seq
 Makefile                   guest build, host build (libcmt mock + libcma), host-test, deps, seq-* targets
@@ -66,7 +66,7 @@ docs/                      how to build, send inputs, prove the accounts drive a
 ```sh
 make deps && make host-test        # host: 290 unit checks + mock e2e (needs g++ 14, cast)
 cartesi build && cartesi hash      # classic template with the state NVRAMs (needs Docker + Cartesi CLI)
-pytest tests/machine -v            # machine tests of the variant in .cartesi/image (cartesi-machine 0.21.0, cast)
+pytest tests/machine -v            # machine tests of the variant in .cartesi/image (cartesi-machine 0.22.0, cast)
 cartesi run --epoch-length 10 --claim-staging-period 0
 
 make seq-deps seq-host seq-test    # sequencer variant: host binary + fold tests (Rust 1.95, libclang, cmake)

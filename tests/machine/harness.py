@@ -1,7 +1,8 @@
 """Drive a stored qa-tester template with the host `cartesi-machine` CLI, one input per run,
-the same way the node's advancer does (fresh load, advance, store), so every test is byte-exact and
-needs nothing but the emulator, the kernel, the image under .cartesi/image and Foundry's `cast`
-(the same encoder the docs tell humans to use: docs/inputs.md).
+the same way the node's advancer does (an on-disk clone of the image, advance with a stored
+snapshot, keep it when accepted), so every test is byte-exact and needs nothing but the emulator
+(0.22.0), the image under .cartesi/image and Foundry's `cast` (the same encoder the docs tell
+humans to use: docs/inputs.md).
 """
 import glob
 import json
@@ -221,6 +222,7 @@ class Machine:
         self.index = 0
         self.block = 100
         self.last_proof = None  # outputs-merkle-root proof of the previous accepted input
+        self.last_root = None   # outputs Merkle root file of the last accepted input (None: empty tree)
         self.keep = keep
         self.runs = 0
 
@@ -228,8 +230,8 @@ class Machine:
         if not self.keep:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _run(self, args, timeout=600):
-        cmd = ["cartesi-machine", f"--load={self.image}"] + args
+    def _run(self, args, timeout=600, load=None):
+        cmd = ["cartesi-machine", f"--load={load or self.image}"] + args
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return p
 
@@ -241,7 +243,7 @@ class Machine:
         work = os.path.join(self.tmp, f"work-{self.runs}")
         self.runs += 1
         os.makedirs(work)
-        new_image = os.path.join(work, "new_image")
+        machine = os.path.join(work, "machine")
         if block is not None:
             self.block = block
         if raw is None:
@@ -257,41 +259,47 @@ class Machine:
             f"outputs_merkle_root_proof:{work}/input-%i-outputs-merkle-root-proof.json",
             f"output_proof:{work}/output-%o-input-%i-proof.json",
             "format:json",
-            f"input_index_begin:{self.index}",
-            f"input_index_end:{self.index + 1}",
+            f"input_file_index_begin:{self.index}",
+            f"input_file_index_end:{self.index + 1}",
             f"check_outputs_merkle_root:{'true' if check_root else 'false'}",
         ]
         if self.last_proof is not None and check_root:
             fields.append(f"last_output_proof:{self.last_proof}")
-        args = [f"--store={new_image}", "--revert-mode=none", "--assert-rolling-template", "--final-hash",
-                "--cmio-advance-state=" + ",".join(fields)]
+        # emulator 0.22: the run works on an on-disk clone of the image (sharing:all) and
+        # --revert-mode=stored snapshots it, so an accepted input leaves the new state in the clone
+        # and a rejected one leaves the state the input started from (no --store)
+        root = f"{work}/input-{self.index}-outputs-merkle-root.bin"
+        args = ["--revert-mode=stored", "--final-hash", "--cmio-advance-state=" + ",".join(fields)]
         if max_mcycle is not None:
             args.append(f"--max-mcycle={max_mcycle}")
-        p = self._run(args, timeout=timeout)
+        p = self._run(args, timeout=timeout, load=f"{machine},clone:{self.image}")
         res = Result(p.returncode, p.stdout, p.stderr)
-        for f in sorted(glob.glob(f"{work}/input-{self.index}-output-*.bin")):
+        last_number = lambda x: int(x.rsplit("-", 1)[1].split(".")[0])  # %o: global for outputs, per input for reports
+        for f in sorted(glob.glob(f"{work}/input-{self.index}-output-*.bin"), key=last_number):
             res.outputs.append(open(f, "rb").read())
-        for f in sorted(glob.glob(f"{work}/input-{self.index}-rejected-*.bin")):
+        for f in sorted(glob.glob(f"{work}/input-{self.index}-rejected-*.bin"), key=last_number):
             res.rejected_outputs.append(open(f, "rb").read())
-        for f in sorted(glob.glob(f"{work}/input-{self.index}-report-*.bin"),
-                        key=lambda x: int(x.rsplit("-", 1)[1].split(".")[0])):
+        for f in sorted(glob.glob(f"{work}/input-{self.index}-report-*.bin"), key=last_number):
             res.reports.append(open(f, "rb").read())
-        root = f"{work}/input-{self.index}-outputs-merkle-root.bin"
         if os.path.exists(root):
             res.outputs_root = open(root, "rb").read()
-        for line in p.stdout.splitlines():
-            if "Final hash" in line or line.startswith("final hash"):
-                res.final_hash = line.split(":")[-1].strip()
+        for line in p.stdout.splitlines():  # --final-hash prints "<mcycle>: 0x<hash>"
+            if line.split(": 0x")[0].isdigit() and len(line.split(": 0x")[-1]) == 64:
+                res.final_hash = line.split(": ")[-1].strip()
         # the CLI resumes the outputs Merkle tree from the proof of the last *output* of the last run
         proofs = sorted(glob.glob(f"{work}/output-*-input-{self.index}-proof.json"),
                         key=lambda x: int(os.path.basename(x).split("-")[1]))
-        if commit and res.accepted and os.path.isdir(new_image):
+        if commit and res.accepted and os.path.isdir(machine):
             shutil.rmtree(self.image)
-            shutil.copytree(new_image, self.image)
+            os.rename(machine, self.image)
             if proofs:
                 self.last_proof = proofs[-1]
+            self.last_root = root
             self.index += 1
             self.block += 1
+        else:
+            shutil.rmtree(machine, ignore_errors=True)
+            shutil.rmtree(machine + ".revert", ignore_errors=True)
         return res
 
     def inspect(self, payload: bytes, timeout=600):
@@ -300,7 +308,10 @@ class Machine:
         os.makedirs(work)
         with open(os.path.join(work, "query.bin"), "wb") as f:
             f.write(payload)
-        p = self._run(["--revert-mode=none", "--assert-rolling-template",
+        # emulator 0.22: the rolling-template assertion compares the tx buffer with an expected
+        # outputs Merkle root, the empty tree unless a file names the root of the last accepted input
+        template = "--assert-rolling-template" + (f"=outputs_merkle_root:{self.last_root}" if self.last_root else "")
+        p = self._run(["--revert-mode=none", template,
                        "--cmio-inspect-state=" + f"query:{work}/query.bin,report:{work}/query-report-%o.bin"],
                       timeout=timeout)
         res = Result(p.returncode, p.stdout, p.stderr)

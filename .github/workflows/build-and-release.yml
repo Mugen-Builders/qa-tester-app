@@ -3,8 +3,8 @@ run-name: Testing and Releasing the QA tester application
 on: [push, workflow_dispatch]
 
 # Pins (override with repository variables of the same name):
-#   EMULATOR_VERSION 0.21.0, MACHINE_LINUX_VERSION 0.21.0, KERNEL_VERSION 6.5.13-ctsi-2,
-#   XGENEXT2_VERSION 1.5.6-1, CARTESI_CLI_VERSION 2.0.0-alpha.38, FOUNDRY_VERSION v1.4.3,
+#   EMULATOR_VERSION 0.22.0, MACHINE_LINUX_VERSION 0.21.0, KERNEL_VERSION 6.5.13-ctsi-2,
+#   XGENEXT2_VERSION 1.5.6-1, CARTESI_CLI_VERSION 2.0.0-alpha.42, FOUNDRY_VERSION v1.4.3,
 #   RUST_VERSION 1.95.0 (seq/rust-toolchain.toml; the Cartesi sequencer v0.1.0-alpha.10 pin)
 # Foundry's `cast` encodes every test input (docs/inputs.md); the CLI builds, boots and stores the
 # templates with the NVRAMs declared in cartesi.toml / cartesi-seq.toml (docs/build.md,
@@ -77,7 +77,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends squashfs-tools g++-14 jq xxd libclang-dev cmake pkg-config \
             xgenext2fs=${{ vars.XGENEXT2_VERSION || '1.5.6-1' }}
 
-          curl -fsSL -o ${{ runner.temp }}/cartesi-machine.deb https://github.com/cartesi/machine-emulator/releases/download/v${{ vars.EMULATOR_VERSION || '0.21.0' }}/machine-emulator_amd64.deb
+          curl -fsSL -o ${{ runner.temp }}/cartesi-machine.deb https://github.com/cartesi/machine-emulator/releases/download/v${{ vars.EMULATOR_VERSION || '0.22.0' }}/machine-emulator_amd64.deb
           sudo apt-get install -y --no-install-recommends ${{ runner.temp }}/cartesi-machine.deb
 
           curl -fsSL -o ${{ runner.temp }}/linux.bin https://github.com/cartesi/machine-linux-image/releases/download/v${{ vars.MACHINE_LINUX_VERSION || '0.21.0' }}/linux-${{ vars.KERNEL_VERSION || '6.5.13-ctsi-2' }}-v${{ vars.MACHINE_LINUX_VERSION || '0.21.0' }}.bin
@@ -109,7 +109,7 @@ jobs:
 
       - name: Install Cartesi CLI
         run: |
-          npm install -g @cartesi/cli@${{ vars.CARTESI_CLI_VERSION || '2.0.0-alpha.38' }}
+          npm install -g @cartesi/cli@${{ vars.CARTESI_CLI_VERSION || '2.0.0-alpha.42' }}
           cartesi --version
 
       - name: Install Foundry (cast encodes the machine test inputs)
@@ -138,9 +138,8 @@ jobs:
       - name: Check the accounts-drive start index (docs/build.md)
         run: |
           start=$(jq -r '(.config // .).nvram[] | select(.label == "state") | .start' .cartesi/image/config.json)
-          index=$(grep -oP 'accounts_drive_start_index\s*=\s*\K\d+' cartesi.toml)
-          printf 'state NVRAM start %#x -> accounts_drive_start_index %d (cartesi.toml: %d)\n' "$start" $((start >> 22)) "$index"
-          test $((start >> 22)) -eq "$index"
+          printf 'state NVRAM start %#x -> accounts_drive_start_index %d (documented: 560)\n' "$start" $((start >> 22))
+          test $((start >> 22)) -eq 560
 
       - name: Machine tests (classic)
         run: |
@@ -166,10 +165,9 @@ jobs:
       - name: Check the ranges (state index 560, config range after the state)
         run: |
           start=$(jq -r '(.config // .).nvram[] | select(.label == "state") | .start' .cartesi/image/config.json)
-          index=$(grep -oP 'accounts_drive_start_index\s*=\s*\K\d+' cartesi-seq.toml)
           cfgstart=$(jq -r '(.config // .).nvram[] | select(.label == "config") | .start' .cartesi/image/config.json)
-          printf 'state %#x -> index %d (cartesi-seq.toml: %d); config range at %#x\n' "$start" $((start >> 22)) "$index" "$cfgstart"
-          test $((start >> 22)) -eq "$index"
+          printf 'state %#x -> index %d (documented: 560); config range at %#x\n' "$start" $((start >> 22)) "$cfgstart"
+          test $((start >> 22)) -eq 560
 
       - name: Cycle-0 image reproduces the template
         run: |

@@ -2,7 +2,7 @@
 one input per process with the host cartesi-machine like test_machine.py. Inputs from the batch
 submitter (anvil account 9) are SSZ batches; everything else is a direct input that waits in the
 scheduler's queue until a frame covers it. Needs `.cartesi/image` from `cartesi build -c
-cartesi-seq.toml` (or QA_IMAGE), cartesi-machine 0.21.0 and Foundry's cast.
+cartesi-seq.toml` (or QA_IMAGE), cartesi-machine 0.22.0 and Foundry's cast.
 """
 import json
 import os
@@ -60,7 +60,7 @@ def test_ranges_keep_the_accounts_drive_provable(m):
     cfg = h.image_config(m.image)
     ranges = {d["label"]: d for d in cfg["nvram"]}
     assert ranges["state"]["start"] == 0x8C000000 and ranges["state"]["length"] == 64 << 20
-    assert ranges["state"]["start"] >> 22 == 560  # [withdrawal.config].accounts_drive_start_index
+    assert ranges["state"]["start"] >> 22 == 560  # accounts_drive_start_index the CLI derives
     assert ranges["config"]["start"] == 0x90000000 and ranges["config"]["length"] == 4096
     f, _ = m.read_range("config")
     cfgrange = f.read()

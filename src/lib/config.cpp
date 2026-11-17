@@ -16,7 +16,7 @@ static Address must_addr(const char *hex) {
 
 Config Config::devnet_defaults() {
     Config c;
-    // rollups-contracts v3.0.0-alpha.10 devnet (`cartesi address-book`, CLI 2.0.0-alpha.38)
+    // rollups-contracts v3.0.0-alpha.10 devnet (`cartesi address-book`, CLI 2.0.0-alpha.42)
     c.token = must_addr("0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81"); // TestUsdc
     c.ether_portal = must_addr("0x035b11Be55656c6cfC822D1CaE568C1Af2e497b0");
     c.erc20_portal = must_addr("0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419");

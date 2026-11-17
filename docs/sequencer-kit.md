@@ -27,7 +27,7 @@ Devnet values (anvil's default accounts):
 | a user (account 1) | `0x70997970C51812dc3A010C7d01b50e0d17dc79C8` | `0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d` |
 | accounts-drive token (TestUsdc) | `0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81` | mintable by anyone |
 
-Tools: Foundry `anvil` and `cast` (1.4.x), `cartesi-machine` 0.21.0 (the stored images carry
+Tools: Foundry `anvil` and `cast` (1.4.x), `cartesi-machine` 0.22.0 (the stored images carry
 their RAM, no kernel image is needed), `jq`, `curl`, `xxd`.
 
 ## 1. The devnet
@@ -134,14 +134,15 @@ cast logs --rpc-url $RPC --from-block 0 --to-block $HEAD --address $INPUT_BOX 'I
     | jq -r '.[].data' | while read -r data; do
         cast abi-decode 'f()(bytes)' "$data" | sed 's/^0x//' | xxd -r -p > replay/input-$n.bin; n=$((n + 1)); done
 N=$(ls replay/input-*.bin | wc -l)
-cartesi-machine --load=image/genesis-devnet --revert-mode=none --assert-rolling-template --final-hash --store=replay/machine \
-    --cmio-advance-state=input:replay/input-%i.bin,input_index_begin:0,input_index_end:$N,output:replay/input-%i-output-%o.bin,report:replay/input-%i-report-%o.bin,format:json
+cartesi-machine --load=replay/machine,clone:image/genesis-devnet --revert-mode=stored --final-hash \
+    --cmio-advance-state=input:replay/input-%i.bin,input_file_index_begin:0,input_file_index_end:$N,output:replay/input-%i-output-%o.bin,report:replay/input-%i-report-%o.bin,format:json
 STATE=$(jq -r '(.config // .).nvram[] | select(.label == "state") | .backing_store.data_filename' replay/machine/config.json)
 sha256sum replay/machine/$STATE; curl -s $SEQ/finalized_state/digest | jq -r .sha256     # equal
 curl -s -o finalized.state $SEQ/finalized_state && cmp finalized.state replay/machine/$STATE && echo same bytes
 ```
 
-(`InputAdded`'s `bytes` is the ABI-encoded log data, which `cast abi-decode` unwraps; the payload
+(`replay/machine` is an on-disk clone of the genesis image that the run advances in place:
+`--revert-mode=stored` keeps accepted inputs and rolls rejected ones back. `InputAdded`'s `bytes` is the ABI-encoded log data, which `cast abi-decode` unwraps; the payload
 is the `EvmAdvance` calldata the machine consumes, batches from the submitter included.) The
 `state` inspect of the replayed machine (`--cmio-inspect-state`) shows `scheduler.next_batch_nonce`,
 equal to `accepted_checkpoint.next_batch_nonce` of `GET /history`.

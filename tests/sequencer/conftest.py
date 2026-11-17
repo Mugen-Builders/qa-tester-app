@@ -39,7 +39,7 @@ CHAIN_ID = 31337
 # ahead of the wall clock, and the sequencer treats a safe head >= seconds-per-block ahead of its
 # clock as an unusable L1 view, so the block time it is told is generous.
 SECONDS_PER_BLOCK = 6
-# cartesi.toml [withdrawal.config]
+# cartesi.toml [withdrawal], and what the CLI derives from the accounts drive in [nvrams.state]
 WITHDRAWAL_CONFIG = f"({A0},0,17,560,0xB4D253c7a110241561B3eD6d632846dF7d4e9Af7)"
 
 
