@@ -4,3 +4,4 @@ third-party/
 docs/
 tests/
 *.md
+seq/target/

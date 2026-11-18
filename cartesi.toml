@@ -1,11 +1,13 @@
-# Cartesi CLI (2.0.0-alpha.38) configuration for qa-tester-app. See docs/build.md.
+# Cartesi CLI (2.0.0-alpha.42) configuration for qa-tester-app (classic variant; the sequencer
+# variant is cartesi-seq.toml). See docs/build.md.
 #
-# The ledger state lives in one 64 MiB NVRAM (/dev/uio0: UIO range, no page cache, no filesystem):
-# the accounts drive + single-asset ledger in its first 32 MiB, every other asset after that.
-# `cartesi build` builds the root/app drives, boots the machine with the NVRAM declared in
-# [nvrams.state] and stores the template in .cartesi/image. The emulator places the NVRAM after the
-# last flash drive, aligned to its own length, so [withdrawal.config].accounts_drive_start_index
-# (= NVRAM start >> 22) can only be checked after a build: docs/build.md has the one-liner.
+# The state lives in one 64 MiB NVRAM (/dev/uio0: a UIO range, no page cache, no filesystem): the
+# accounts drive + single-asset ledger in its first 32 MiB, every other asset after that, then the
+# meta page and the nonce table (docs/accounts-drive.md). `cartesi build` builds the root/app
+# drives, boots the machine with the NVRAM declared in [nvrams.state] and stores the template in
+# .cartesi/image. The emulator places NVRAMs after the last flash drive, each aligned to its own
+# length; the CLI reads the start of the range marked `accounts_drive = true` from the built
+# machine and derives the withdrawal config from it (docs/build.md).
 
 [machine]
 entrypoint = "/mnt/app/qa-tester /dev/uio0"
@@ -41,14 +43,17 @@ target = "app"
 format = "sqfs"
 
 # The state NVRAM: 64 MiB, /dev/uio0, owned by the app user. Being 64 MiB long it is 64 MiB-aligned
-# by the emulator, so its 4 MiB accounts-drive prefix is a whole Merkle subtree that can be proved.
+# by the emulator, so its 4 MiB accounts-drive prefix (2^17 accounts of 32 bytes) is a whole Merkle
+# subtree that can be proved.
 [nvrams.state]
 size = "64Mi"
 user = "dapp"
+accounts_drive = true
+accounts_drive_size = "4Mi"
 
-[withdrawal.config]
+# Emergency withdrawal: the CLI derives log2_leaves_per_account (0: 32-byte accounts),
+# log2_max_num_of_accounts (17) and accounts_drive_start_index (state start >> 22 = 560) from the
+# accounts drive above and passes them to the deployment.
+[withdrawal]
 guardian = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"   # anvil account 0
-log2_leaves_per_account = 0
-log2_max_num_of_accounts = 17
-accounts_drive_start_index = 560   # = state NVRAM start (0x8c000000) >> 22; check after every build (docs/build.md)
 withdrawal_output_builder = "0xB4D253c7a110241561B3eD6d632846dF7d4e9Af7"   # TestUsdWithdrawalOutputBuilder (devnet)

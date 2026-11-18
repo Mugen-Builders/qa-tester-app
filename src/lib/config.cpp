@@ -16,7 +16,7 @@ static Address must_addr(const char *hex) {
 
 Config Config::devnet_defaults() {
     Config c;
-    // rollups-contracts v3.0.0-alpha.10 devnet (`cartesi address-book`, CLI 2.0.0-alpha.38)
+    // rollups-contracts v3.0.0-alpha.10 devnet (`cartesi address-book`, CLI 2.0.0-alpha.42)
     c.token = must_addr("0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81"); // TestUsdc
     c.ether_portal = must_addr("0x035b11Be55656c6cfC822D1CaE568C1Af2e497b0");
     c.erc20_portal = must_addr("0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419");
@@ -77,12 +77,18 @@ bool Config::apply_env(std::string &err) {
     }
     log = log_v != 0;
     if (!env_u64("QA_SINGLE_ACCOUNTS", single_accounts, err) || !env_u64("QA_REGION_A_LENGTH", region_a_length, err) ||
-        !env_u64("QA_REGION_B_LENGTH", region_b_length, err) || !env_u64("QA_MULTI_ACCOUNTS", multi_accounts, err) ||
+        !env_u64("QA_REGION_B_LENGTH", region_b_length, err) || !env_u64("QA_REGION_C_LENGTH", region_c_length, err) ||
+        !env_u64("QA_MULTI_ACCOUNTS", multi_accounts, err) ||
         !env_u64("QA_MULTI_ASSETS", multi_assets, err) || !env_u64("QA_MULTI_BALANCES", multi_balances, err)) {
         return false;
     }
     if (single_accounts == 0 || (single_accounts & (single_accounts - 1)) != 0) {
         err = "QA_SINGLE_ACCOUNTS: must be a power of two";
+        return false;
+    }
+    if (region_c_length < 2 * 4096 || region_a_length % 4096 != 0 || region_b_length % 4096 != 0 ||
+        region_c_length % 4096 != 0) {
+        err = "QA_REGION_*_LENGTH: regions must be page multiples and region C at least two pages";
         return false;
     }
     return true;
@@ -96,7 +102,7 @@ std::string Config::describe_json() const {
       << to_hex(erc1155_batch_portal) << "\",\"safe_erc20_transfer\":\"" << to_hex(safe_erc20_transfer)
       << "\",\"deposit_policy\":" << static_cast<int>(deposit_policy) << ",\"single_accounts\":" << single_accounts
       << ",\"accounts_drive_length\":" << accounts_drive_length() << ",\"region_a_length\":" << region_a_length
-      << ",\"region_b_length\":" << region_b_length << "}";
+      << ",\"region_b_length\":" << region_b_length << ",\"region_c_length\":" << region_c_length << "}";
     return o.str();
 }
 

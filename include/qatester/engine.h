@@ -1,6 +1,8 @@
-// The input-processing engine. Shaped after the sequencer's application-engine.h: a direct
-// input goes in, outputs stream out through a sink, the state lives in one file, progress is a
-// (count, clock) pair. The rollup device is never touched here; see src/main.cpp.
+// The input-processing engine. Shaped after the sequencer's application-engine.h: a direct input
+// or a validated user op goes in, outputs stream out through a sink, the state lives in one memory
+// range (ledger.h, state.h), progress is a (count, clock) pair kept in the meta page. The rollup
+// device is never touched here; see src/main.cpp (classic driver), src/seq_main.cpp (sequencer
+// guest driver) and src/lib/app_engine.cpp (the C ABI the sequencer links).
 #pragma once
 
 #include "config.h"
@@ -9,22 +11,70 @@
 #include "types.h"
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace qatester {
 
+enum class OpenErrorKind : uint8_t { NotFound, InvalidDump, Io };
+
+struct OpenError : std::runtime_error {
+    OpenErrorKind kind;
+    OpenError(OpenErrorKind k, const std::string &what) : std::runtime_error(what), kind(k) {}
+};
+
+// Why a user op was refused (application-engine.h's ApplicationEngineInvalid, minus the reasons
+// that belong to the caller).
+struct UserOpInvalid {
+    enum class Reason : uint8_t { Nonce, FeeBalance } reason{Reason::Nonce};
+    uint32_t expected{};  // Nonce
+    uint32_t got{};       // Nonce
+    U256 required;        // FeeBalance (all ones: no balance could ever cover it)
+    U256 available;       // FeeBalance
+};
+
 class Engine {
 public:
-    Engine(Config cfg, const std::string &state_file, const std::string &ledger_file = ""); // throws std::runtime_error
+    // Writes a genesis state into a blank range: libcma ledgers created, meta page with count 0,
+    // clock 0, the configured deposit policy, the batch submitter address and `cfg.token` (the
+    // accounts-drive asset, pinned from then on: opening the state uses the pinned token, not the
+    // environment). A regular file is created or grown to the configured length. Throws
+    // std::runtime_error, also when the magic is already set.
+    static void genesis(const Config &cfg, const std::string &state_path, const Address &sequencer);
+    // Whether the range carries a genesis (meta page magic + layout version). Throws OpenError for a
+    // missing or unreadable path.
+    [[nodiscard]] static bool is_initialized(const Config &cfg, const std::string &state_path);
+
+    // Opens an initialised state; never creates. Throws OpenError (InvalidDump without the magic).
+    Engine(Config cfg, const std::string &state_path);
     ~Engine();
     Engine(const Engine &) = delete;
     Engine &operator=(const Engine &) = delete;
 
-    // Never throws. Emits through `sink`; fills `terminal` for non Accept/Reject completions.
+    // Never throw. Emit through `sink`; fill `terminal` for non Accept/Reject completions. Neither
+    // touches the progress: the driver decides what counts (commit_progress / note_reject).
     Completion execute_direct_input(const DirectInput &input, OutputSink &sink, TerminalArgs &terminal);
     Completion inspect(bytes_view payload, OutputSink &sink, TerminalArgs &terminal);
 
+    // User ops (sequencer). validate is pure: nonce must equal the sender's expected nonce and the
+    // sender's accounts-drive balance must cover fee::to_linear(current_fee). execute charges
+    // fee::to_linear(fee) to the batch submitter's account, advances the nonce by one and runs the
+    // payload like a direct input (`in.block_number` is the frame's safe block). It throws
+    // std::runtime_error when a validated op cannot pay (an invariant failure, fatal for the engine).
+    [[nodiscard]] bool validate_user_op(const Address &sender, uint32_t nonce, uint16_t current_fee,
+        UserOpInvalid &invalid) const;
+    Completion execute_user_op(const DirectInput &in, uint16_t fee, OutputSink &sink, TerminalArgs &terminal);
+
+    void commit_progress(uint64_t block); // count + 1 (checked), clock = max(clock, block)
+    void note_reject();                   // rejected_count + 1
+
     [[nodiscard]] Progress progress() const;
+    [[nodiscard]] uint64_t rejected_count() const;
+    [[nodiscard]] uint32_t nonce_of(const Address &sender) const;
+    [[nodiscard]] Address sequencer() const;
+    [[nodiscard]] Address token() const; // the pinned accounts-drive asset (= config().token)
+    // Scheduler facts shown by the `state` inspect report (set by the sequencer guest driver).
+    void set_scheduler_status(uint64_t next_batch_nonce, uint64_t queued_directs);
     [[nodiscard]] const Config &config() const;
     [[nodiscard]] Ledger &ledger();
     void flush();

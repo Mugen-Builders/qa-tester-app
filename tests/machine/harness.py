@@ -1,7 +1,8 @@
 """Drive a stored qa-tester template with the host `cartesi-machine` CLI, one input per run,
-the same way the node's advancer does (fresh load, advance, store), so every test is byte-exact and
-needs nothing but the emulator, the kernel, the image under .cartesi/image and Foundry's `cast`
-(the same encoder the docs tell humans to use: docs/inputs.md).
+the same way the node's advancer does (an on-disk clone of the image, advance with a stored
+snapshot, keep it when accepted), so every test is byte-exact and needs nothing but the emulator
+(0.22.0), the image under .cartesi/image and Foundry's `cast` (the same encoder the docs tell
+humans to use: docs/inputs.md).
 """
 import glob
 import json
@@ -17,6 +18,13 @@ ROOT = HERE.parent.parent
 
 APP = "0x" + "ab" * 20
 USER = "0x1111111111111111111111111111111111111111"
+# sequencer variant: batch submitter = anvil account 9 (the devnet default written by `make seq/config-devnet.bin`)
+SEQUENCER = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
+SEQUENCER_KEY = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+# a signing user: anvil account 1
+SIGNER = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+SIGNER_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+MAX_WAIT_BLOCKS = 1200
 TOKEN = "0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81"
 ERC20_PORTAL = "0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419"
 ETHER_PORTAL = "0x035b11Be55656c6cfC822D1CaE568C1Af2e497b0"
@@ -95,6 +103,88 @@ def packed_deposit(kind: str, *args) -> bytes:
     raise ValueError(f"unknown deposit kind {kind}")
 
 
+# ---------------------------------------------------------------- sequencer batches (SSZ)
+# sequencer-core/src/batch.rs: Batch{nonce u64, frames List<Frame>}, Frame{user_ops List<WireUserOp>,
+# safe_block u64, fee_price u16}, WireUserOp{nonce u32, max_fee u16, data List<u8>, signature List<u8>}.
+# SSZ containers: fixed fields in place, variable ones as 4-byte offsets followed by their bytes.
+# seq/guest/tests/fold.rs pins the same vector (ssz_vector_for_the_python_harness).
+def _ssz_container(fixed_parts, variable_parts):
+    """fixed_parts: list of bytes or None (None = a variable field at that position, in order)."""
+    fixed_len = sum(len(p) if p is not None else 4 for p in fixed_parts)
+    out = b""
+    offset = fixed_len
+    vi = 0
+    for p in fixed_parts:
+        if p is None:
+            out += offset.to_bytes(4, "little")
+            offset += len(variable_parts[vi])
+            vi += 1
+        else:
+            out += p
+    return out + b"".join(variable_parts)
+
+
+def _ssz_list_of_variable(items: list) -> bytes:
+    offsets = b""
+    off = 4 * len(items)
+    for it in items:
+        offsets += off.to_bytes(4, "little")
+        off += len(it)
+    return offsets + b"".join(items)
+
+
+def user_op(nonce: int, max_fee: int, data: bytes, signature: bytes) -> bytes:
+    return _ssz_container([nonce.to_bytes(4, "little"), max_fee.to_bytes(2, "little"), None, None], [data, signature])
+
+
+def frame(safe_block: int, fee_price: int = 0, user_ops=()) -> bytes:
+    return _ssz_container([None, safe_block.to_bytes(8, "little"), fee_price.to_bytes(2, "little")],
+                          [_ssz_list_of_variable(list(user_ops))])
+
+
+def batch(nonce: int, frames) -> bytes:
+    """SSZ Batch; `frames` are `frame(...)` byte strings."""
+    return _ssz_container([nonce.to_bytes(8, "little"), None], [_ssz_list_of_variable(list(frames))])
+
+
+def sign_user_op(private_key: str, nonce: int, max_fee: int, data: bytes, chain: int = 31337, app: str = APP) -> bytes:
+    """EIP-712 signature of UserOp{uint32 nonce; uint16 max_fee; bytes data} under the sequencer's
+    domain (CartesiAppSequencer/1, verifyingContract = app), produced by `cast wallet sign --data`.
+    The 65 bytes (r, s, v) are what the sequencer's POST /tx and the batch envelope carry."""
+    typed = {
+        "types": {
+            "EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"},
+                             {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
+            "UserOp": [{"name": "nonce", "type": "uint32"}, {"name": "max_fee", "type": "uint16"},
+                       {"name": "data", "type": "bytes"}],
+        },
+        "primaryType": "UserOp",
+        "domain": {"name": "CartesiAppSequencer", "version": "1", "chainId": chain, "verifyingContract": app},
+        "message": {"nonce": nonce, "max_fee": max_fee, "data": "0x" + data.hex()},
+    }
+    p = subprocess.run(["cast", "wallet", "sign", "--private-key", private_key, "--data", json.dumps(typed)],
+                       capture_output=True, text=True, check=True)
+    sig = bytes.fromhex(p.stdout.strip()[2:])
+    assert len(sig) == 65, sig.hex()
+    return sig
+
+
+def checksum(address: str) -> str:
+    """EIP-55 casing (what the sequencer's JSON carries)."""
+    p = subprocess.run(["cast", "to-check-sum-address", address], capture_output=True, text=True, check=True)
+    return p.stdout.strip()
+
+
+def image_config(image) -> dict:
+    cfg = json.load(open(os.path.join(image, "config.json")))
+    return cfg.get("config", cfg)
+
+
+def image_has_range(image, label: str) -> bool:
+    cfg = image_config(image)
+    return any(d.get("label") == label for d in cfg.get("nvram", []) + cfg.get("flash_drive", []))
+
+
 @dataclass
 class Result:
     returncode: int
@@ -132,6 +222,7 @@ class Machine:
         self.index = 0
         self.block = 100
         self.last_proof = None  # outputs-merkle-root proof of the previous accepted input
+        self.last_root = None   # outputs Merkle root file of the last accepted input (None: empty tree)
         self.keep = keep
         self.runs = 0
 
@@ -139,18 +230,24 @@ class Machine:
         if not self.keep:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _run(self, args, timeout=600):
-        cmd = ["cartesi-machine", f"--load={self.image}"] + args
+    def _run(self, args, timeout=600, load=None):
+        cmd = ["cartesi-machine", f"--load={load or self.image}"] + args
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return p
 
     def advance(self, payload: bytes, sender=USER, commit=True, check_root=True, timeout=600,
-                max_mcycle=None):
+                max_mcycle=None, block=None, raw=None):
+        """One input. `block` overrides the running block number (the sequencer tests choose the
+        inclusion blocks that frames cover); the next input continues after it. `raw` feeds a
+        ready-made EvmAdvance input (the bytes an InputBox InputAdded event carries) instead."""
         work = os.path.join(self.tmp, f"work-{self.runs}")
         self.runs += 1
         os.makedirs(work)
-        new_image = os.path.join(work, "new_image")
-        raw = evm_advance(payload, sender, app=APP, block=self.block, index=self.index)
+        machine = os.path.join(work, "machine")
+        if block is not None:
+            self.block = block
+        if raw is None:
+            raw = evm_advance(payload, sender, app=APP, block=self.block, index=self.index)
         with open(os.path.join(work, f"input-{self.index}.bin"), "wb") as f:
             f.write(raw)
         fields = [
@@ -162,41 +259,47 @@ class Machine:
             f"outputs_merkle_root_proof:{work}/input-%i-outputs-merkle-root-proof.json",
             f"output_proof:{work}/output-%o-input-%i-proof.json",
             "format:json",
-            f"input_index_begin:{self.index}",
-            f"input_index_end:{self.index + 1}",
+            f"input_file_index_begin:{self.index}",
+            f"input_file_index_end:{self.index + 1}",
             f"check_outputs_merkle_root:{'true' if check_root else 'false'}",
         ]
         if self.last_proof is not None and check_root:
             fields.append(f"last_output_proof:{self.last_proof}")
-        args = [f"--store={new_image}", "--revert-mode=none", "--assert-rolling-template", "--final-hash",
-                "--cmio-advance-state=" + ",".join(fields)]
+        # emulator 0.22: the run works on an on-disk clone of the image (sharing:all) and
+        # --revert-mode=stored snapshots it, so an accepted input leaves the new state in the clone
+        # and a rejected one leaves the state the input started from (no --store)
+        root = f"{work}/input-{self.index}-outputs-merkle-root.bin"
+        args = ["--revert-mode=stored", "--final-hash", "--cmio-advance-state=" + ",".join(fields)]
         if max_mcycle is not None:
             args.append(f"--max-mcycle={max_mcycle}")
-        p = self._run(args, timeout=timeout)
+        p = self._run(args, timeout=timeout, load=f"{machine},clone:{self.image}")
         res = Result(p.returncode, p.stdout, p.stderr)
-        for f in sorted(glob.glob(f"{work}/input-{self.index}-output-*.bin")):
+        last_number = lambda x: int(x.rsplit("-", 1)[1].split(".")[0])  # %o: global for outputs, per input for reports
+        for f in sorted(glob.glob(f"{work}/input-{self.index}-output-*.bin"), key=last_number):
             res.outputs.append(open(f, "rb").read())
-        for f in sorted(glob.glob(f"{work}/input-{self.index}-rejected-*.bin")):
+        for f in sorted(glob.glob(f"{work}/input-{self.index}-rejected-*.bin"), key=last_number):
             res.rejected_outputs.append(open(f, "rb").read())
-        for f in sorted(glob.glob(f"{work}/input-{self.index}-report-*.bin"),
-                        key=lambda x: int(x.rsplit("-", 1)[1].split(".")[0])):
+        for f in sorted(glob.glob(f"{work}/input-{self.index}-report-*.bin"), key=last_number):
             res.reports.append(open(f, "rb").read())
-        root = f"{work}/input-{self.index}-outputs-merkle-root.bin"
         if os.path.exists(root):
             res.outputs_root = open(root, "rb").read()
-        for line in p.stdout.splitlines():
-            if "Final hash" in line or line.startswith("final hash"):
-                res.final_hash = line.split(":")[-1].strip()
+        for line in p.stdout.splitlines():  # --final-hash prints "<mcycle>: 0x<hash>"
+            if line.split(": 0x")[0].isdigit() and len(line.split(": 0x")[-1]) == 64:
+                res.final_hash = line.split(": ")[-1].strip()
         # the CLI resumes the outputs Merkle tree from the proof of the last *output* of the last run
         proofs = sorted(glob.glob(f"{work}/output-*-input-{self.index}-proof.json"),
                         key=lambda x: int(os.path.basename(x).split("-")[1]))
-        if commit and res.accepted and os.path.isdir(new_image):
+        if commit and res.accepted and os.path.isdir(machine):
             shutil.rmtree(self.image)
-            shutil.copytree(new_image, self.image)
+            os.rename(machine, self.image)
             if proofs:
                 self.last_proof = proofs[-1]
+            self.last_root = root
             self.index += 1
             self.block += 1
+        else:
+            shutil.rmtree(machine, ignore_errors=True)
+            shutil.rmtree(machine + ".revert", ignore_errors=True)
         return res
 
     def inspect(self, payload: bytes, timeout=600):
@@ -205,7 +308,10 @@ class Machine:
         os.makedirs(work)
         with open(os.path.join(work, "query.bin"), "wb") as f:
             f.write(payload)
-        p = self._run(["--revert-mode=none", "--assert-rolling-template",
+        # emulator 0.22: the rolling-template assertion compares the tx buffer with an expected
+        # outputs Merkle root, the empty tree unless a file names the root of the last accepted input
+        template = "--assert-rolling-template" + (f"=outputs_merkle_root:{self.last_root}" if self.last_root else "")
+        p = self._run(["--revert-mode=none", template,
                        "--cmio-inspect-state=" + f"query:{work}/query.bin,report:{work}/query-report-%o.bin"],
                       timeout=timeout)
         res = Result(p.returncode, p.stdout, p.stderr)
@@ -214,12 +320,24 @@ class Machine:
             res.reports.append(open(f, "rb").read())
         return res
 
-    def read_state_drive(self, image=None, length=64 * 1024 * 1024):
-        cfg = json.load(open(os.path.join(image or self.image, "config.json")))
-        cfg = cfg.get("config", cfg)
+    def read_range(self, label="state", image=None):
+        """The stored file of a labeled range plus its config entry."""
+        cfg = image_config(image or self.image)
         for d in cfg.get("nvram", []) + cfg.get("flash_drive", []):
-            if d.get("label") == "state" or d.get("length") == length:
+            if d.get("label") == label:
                 name = os.path.basename(d["backing_store"]["data_filename"])
                 return open(os.path.join(image or self.image, name), "rb"), d
-        raise FileNotFoundError("state range not found")
+        raise FileNotFoundError(f"range {label} not found")
+
+    def read_state_drive(self, image=None):
+        return self.read_range("state", image)
+
+    def state_bytes(self, image=None) -> bytes:
+        """The comparison bytes of the application: the whole `state` range, exactly the host
+        engine's dump (docs/sequencer.md)."""
+        f, _ = self.read_range("state", image)
+        try:
+            return f.read()
+        finally:
+            f.close()
 

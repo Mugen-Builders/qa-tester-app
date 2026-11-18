@@ -1,13 +1,18 @@
-// Ledger facade over libcma: one state range (in the machine the `state` NVRAM, /dev/uio0) holding
-//   region A [0, region_a_length): single-asset ledger for the configured ERC-20, file-backed
-//            (create-or-open, libcma footer). Its first single_accounts*32 bytes are the accounts
-//            drive (uint96 LE balance + address records) that rollups-contracts v3 proves for
-//            emergency withdrawals, and libcma's account-driver-reader reads from a stored image.
-//   region B [region_a_length, +region_b_length): multi-asset ledger for every other asset
-//            (Ether, other ERC-20s, ERC-721, ERC-1155). File-backed when the range is a file or a
-//            flash drive; buffer mode over a mapping of the whole NVRAM when it is a UIO device
-//            (UIO cannot be mapped at a byte offset).
-// A second path may be given to put region B in another range instead.
+// Ledger facade over libcma. The state is one memory range (the `state` NVRAM in the machine, a
+// plain file on the host) holding:
+//   region A [0, region_a_length): single-asset ledger for the configured ERC-20
+//            (cma_ledger_init_single_file: create-or-open, libcma footer at its end). Its first
+//            single_accounts*32 bytes are the accounts drive (uint96 LE balance + address records)
+//            that rollups-contracts v3 proves for emergency withdrawals.
+//   region B [region_a_length, +region_b_length): multi-asset ledger for every other asset (Ether,
+//            other ERC-20s, ERC-721, ERC-1155): credited and withdrawable through vouchers, never
+//            on the accounts drive. Its bytes are libcma's *file-mode* layout (heap + footer), so a
+//            dump reopens on the host with cma_ledger_init_file at this offset. A UIO range cannot
+//            be mapped at a byte offset, so the machine builds the same bytes with
+//            cma_ledger_init_buffer over the heap part and writes libcma's footer itself
+//            (ledger.cpp, `region_b_footer`); the host unit tests pin that equivalence.
+//   region C [region_a_length + region_b_length, +region_c_length): meta page + nonce table
+//            (state.h), owned by the engine and exposed here as a raw mapping.
 #pragma once
 
 #include "config.h"
@@ -41,9 +46,10 @@ struct AccountRef {
 
 class Ledger {
 public:
-    // create-or-open; throws std::runtime_error. `ledger_file` empty or equal to `state_file` puts the
-    // multi-asset region in the same file after the state region.
-    Ledger(const Config &cfg, const std::string &state_file, const std::string &ledger_file = "");
+    // create-or-open; throws std::runtime_error. A regular file is grown to the configured length.
+    // `emulate_nvram` makes a regular file take the machine's path for region B (buffer mode + the
+    // footer written here): for the tests that pin it against libcma's file mode.
+    explicit Ledger(const Config &cfg, const std::string &state_path, bool emulate_nvram = false);
     ~Ledger();
     Ledger(const Ledger &) = delete;
     Ledger &operator=(const Ledger &) = delete;
@@ -58,8 +64,9 @@ public:
     [[nodiscard]] std::string last_error() const;
 
     [[nodiscard]] bytes_view accounts_drive() const; // the proven prefix of region A
+    [[nodiscard]] uint8_t *region_c();               // meta page + nonce table (region_c_length bytes)
     [[nodiscard]] bool is_nvram() const;             // state path is a character device (UIO NVRAM)
-    void flush();
+    void flush();                                    // msync of the mappings (no-op on an NVRAM)
 
 private:
     struct Impl;
